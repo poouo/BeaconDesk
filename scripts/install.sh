@@ -4,6 +4,7 @@ set -eu
 APP_NAME="beacondesk-relay"
 REPO="${BEACONDESK_REPO:-poouo/BeaconDesk}"
 VERSION="${BEACONDESK_VERSION:-latest}"
+BUILD_FROM_SOURCE="${BEACONDESK_BUILD_FROM_SOURCE:-0}"
 CONFIG_DIR="${BEACONDESK_CONFIG_DIR:-/etc/beacondesk}"
 LOG_DIR="${BEACONDESK_LOG_DIR:-/var/log/beacondesk}"
 BIN_PATH="${BEACONDESK_BIN_PATH:-/usr/local/bin/${APP_NAME}}"
@@ -47,9 +48,13 @@ download_file() {
   url="$1"
   path="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$path"
+    if ! curl -fsSL "$url" -o "$path"; then
+      return 1
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$path"
+    if ! wget -q "$url" -O "$path"; then
+      return 1
+    fi
   else
     echo "curl or wget is required." >&2
     exit 1
@@ -163,17 +168,56 @@ install_binary() {
   sums_tmp="$(mktemp)"
   trap 'rm -f "$tmp" "$sums_tmp"' EXIT
   echo "Downloading ${asset} from ${REPO} (${VERSION})"
-  download_file "$(release_url "$asset")" "$tmp"
-  download_file "$(release_url "SHA256SUMS")" "$sums_tmp"
+  if ! download_file "$(release_url "$asset")" "$tmp"; then
+    echo "Release asset not found: ${asset}" >&2
+    echo "The repository may not have a GitHub Release yet, or the release workflow has not uploaded this asset." >&2
+    echo "Create and push a tag such as v0.1.0, wait for GitHub Actions to publish the release, then rerun this installer." >&2
+    echo "Temporary source-build fallback: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | sudo BEACONDESK_BUILD_FROM_SOURCE=1 sh -s -- install" >&2
+    exit 1
+  fi
+  if ! download_file "$(release_url "SHA256SUMS")" "$sums_tmp"; then
+    echo "Release checksum file not found: SHA256SUMS" >&2
+    echo "Refusing to install an unverifiable release asset." >&2
+    exit 1
+  fi
   verify_checksum "$tmp" "$sums_tmp" "$asset"
   install -m 0755 "$tmp" "$BIN_PATH"
+}
+
+install_binary_from_source() {
+  if ! command -v go >/dev/null 2>&1; then
+    echo "Go is required for BEACONDESK_BUILD_FROM_SOURCE=1." >&2
+    exit 1
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is required for BEACONDESK_BUILD_FROM_SOURCE=1." >&2
+    exit 1
+  fi
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  echo "Building ${APP_NAME} from source ${REPO} (${VERSION})"
+  git clone --depth 1 "https://github.com/${REPO}.git" "$tmpdir/src"
+  if [ "$VERSION" != "latest" ]; then
+    git -C "$tmpdir/src" fetch --depth 1 origin "refs/tags/${VERSION}:refs/tags/${VERSION}" 2>/dev/null || true
+    git -C "$tmpdir/src" checkout "$VERSION"
+  fi
+  (cd "$tmpdir/src" && CGO_ENABLED=0 go build -ldflags "-s -w" -o "$tmpdir/${APP_NAME}" ./cmd/relay-server)
+  install -m 0755 "$tmpdir/${APP_NAME}" "$BIN_PATH"
+}
+
+install_binary_auto() {
+  if [ "$BUILD_FROM_SOURCE" = "1" ]; then
+    install_binary_from_source
+  else
+    install_binary
+  fi
 }
 
 do_install() {
   need_root
   need_systemd
   ensure_user_and_dirs
-  install_binary
+  install_binary_auto
   write_default_config
   write_service
   systemctl enable beacondesk-relay
@@ -184,7 +228,7 @@ do_install() {
 do_upgrade() {
   need_root
   need_systemd
-  install_binary
+  install_binary_auto
   write_service
   systemctl restart beacondesk-relay
   systemctl status beacondesk-relay --no-pager
@@ -216,4 +260,3 @@ case "$ACTION" in
     exit 1
     ;;
 esac
-
