@@ -1,0 +1,10 @@
+.beacondesk/
+.openremote/
+.gocache/
+dist/
+build/
+bin/
+*.exe
+*.log
+*.tmp
+.DS_Store

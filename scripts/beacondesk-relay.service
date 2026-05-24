@@ -1,0 +1,20 @@
+[Unit]
+Description=BeaconDesk Connection Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beacondesk
+Group=beacondesk
+ExecStart=/usr/local/bin/beacondesk-relay -config /etc/beacondesk/relay.conf
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/etc/beacondesk /var/log/beacondesk
+
+[Install]
+WantedBy=multi-user.target

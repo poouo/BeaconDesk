@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - run: go test ./...
+
+  build-relay:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            suffix: linux-armv7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build relay
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: go build -o dist/beacondesk-relay-${{ matrix.suffix }} ./cmd/relay-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacondesk-relay-${{ matrix.suffix }}
+          path: dist/beacondesk-relay-${{ matrix.suffix }}
+
+  build-windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Build Windows client
+        run: go build -tags "desktop,production" -ldflags "-H windowsgui" -o dist/beacondesk-client-windows-amd64.exe ./cmd/client-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacondesk-client-windows-amd64
+          path: dist/beacondesk-client-windows-amd64.exe
