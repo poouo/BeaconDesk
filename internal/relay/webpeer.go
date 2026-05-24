@@ -96,6 +96,8 @@ func (p *WebPeer) handleMessage(msg protocol.Envelope) error {
 	switch msg.Type {
 	case protocol.TypeInputMouse, protocol.TypeInputKeyboard:
 		return p.server.forwardWebInputMessage(p, msg)
+	case protocol.TypeStreamControl:
+		return p.server.forwardWebStreamControlMessage(p, msg)
 	case protocol.TypeSessionClose:
 		return p.server.handleWebSessionClose(p, msg)
 	case protocol.TypeHeartbeatPing:
@@ -178,6 +180,24 @@ func (s *Server) forwardWebInputMessage(peer *WebPeer, msg protocol.Envelope) er
 	}
 	if peer.id != session.ControllerID {
 		return fmt.Errorf("only controller can send input for session %s", session.ID)
+	}
+	target := s.getClient(session.ControlledID)
+	if target == nil {
+		return fmt.Errorf("controlled device %s is offline", session.ControlledID)
+	}
+	msg.From = peer.id
+	msg.To = session.ControlledID
+	s.touchSession(session.ID)
+	return sendOrError(target, msg)
+}
+
+func (s *Server) forwardWebStreamControlMessage(peer *WebPeer, msg protocol.Envelope) error {
+	session := s.getSession(msg.SessionID)
+	if session == nil {
+		return fmt.Errorf("session %s not found", msg.SessionID)
+	}
+	if peer.id != session.ControllerID {
+		return fmt.Errorf("only controller can update stream controls for session %s", session.ID)
 	}
 	target := s.getClient(session.ControlledID)
 	if target == nil {

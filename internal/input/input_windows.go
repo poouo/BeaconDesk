@@ -47,28 +47,22 @@ func (windowsInjector) Mouse(event MouseEvent) error {
 	var inputs []input
 	if event.Action == "move" || event.X != 0 || event.Y != 0 {
 		x, y := normalizeAbsolute(event.X, event.Y, event.SourceWidth, event.SourceHeight)
-		inputs = append(inputs, input{
-			Type: inputMouse,
-			Mi: mouseInput{
-				Dx:      x,
-				Dy:      y,
-				DwFlags: mouseeventfMove | mouseeventfAbsolute,
-			},
-		})
+		inputs = append(inputs, newMouseInput(mouseInput{
+			Dx:      x,
+			Dy:      y,
+			DwFlags: mouseeventfMove | mouseeventfAbsolute,
+		}))
 	}
 
 	flags := mouseFlags(event.Button, event.Action)
 	if flags != 0 {
-		inputs = append(inputs, input{Type: inputMouse, Mi: mouseInput{DwFlags: flags}})
+		inputs = append(inputs, newMouseInput(mouseInput{DwFlags: flags}))
 	}
 	if event.Action == "wheel" && event.WheelDelta != 0 {
-		inputs = append(inputs, input{
-			Type: inputMouse,
-			Mi: mouseInput{
-				MouseData: uint32(int32(event.WheelDelta)),
-				DwFlags:   mouseeventfWheel,
-			},
-		})
+		inputs = append(inputs, newMouseInput(mouseInput{
+			MouseData: uint32(int32(event.WheelDelta)),
+			DwFlags:   mouseeventfWheel,
+		}))
 	}
 	if len(inputs) == 0 {
 		return nil
@@ -86,13 +80,12 @@ func (windowsInjector) Keyboard(event KeyboardEvent) error {
 	if event.Action == "up" {
 		flags |= keyeventfKeyUp
 	}
-	return sendInputs([]input{{
-		Type: inputKeyboard,
-		Ki: keyboardInput{
+	return sendInputs([]input{
+		newKeyboardInput(keyboardInput{
 			WScan:   uint16(scan),
 			DwFlags: flags,
-		},
-	}})
+		}),
+	})
 }
 
 func (windowsInjector) Close() error {
@@ -101,9 +94,12 @@ func (windowsInjector) Close() error {
 
 type input struct {
 	Type uint32
-	Mi   mouseInput
-	Ki   keyboardInput
-	_    [8]byte
+	U    inputUnion
+}
+
+type inputUnion struct {
+	_    [0]uintptr
+	Data [unsafe.Sizeof(mouseInput{})]byte
 }
 
 type mouseInput struct {
@@ -121,6 +117,20 @@ type keyboardInput struct {
 	DwFlags     uint32
 	Time        uint32
 	DwExtraInfo uintptr
+}
+
+func newMouseInput(mi mouseInput) input {
+	var in input
+	in.Type = inputMouse
+	*(*mouseInput)(unsafe.Pointer(&in.U.Data[0])) = mi
+	return in
+}
+
+func newKeyboardInput(ki keyboardInput) input {
+	var in input
+	in.Type = inputKeyboard
+	*(*keyboardInput)(unsafe.Pointer(&in.U.Data[0])) = ki
+	return in
 }
 
 func sendInputs(inputs []input) error {

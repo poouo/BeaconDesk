@@ -20,21 +20,28 @@ import (
 	"github.com/poouo/BeaconDesk/internal/trust"
 )
 
+const screenSendingDisabledMessage = "被控端尚未开启屏幕画面发送，请在被控端设置 -> 授权中开启“发送屏幕画面”。"
+
 type Client struct {
-	opts      Options
-	logger    *slog.Logger
-	rootCtx   context.Context
-	conn      transport.Conn
-	connMu    sync.RWMutex
-	identity  auth.DeviceIdentity
-	trust     *trust.Store
-	audit     *audit.Store
-	stateMu   sync.RWMutex
-	state     State
-	events    chan Event
-	cancel    context.CancelFunc
-	closed    chan struct{}
-	closeOnce sync.Once
+	opts           Options
+	optsMu         sync.RWMutex
+	logger         *slog.Logger
+	rootCtx        context.Context
+	conn           transport.Conn
+	connMu         sync.RWMutex
+	writeMu        sync.Mutex
+	identity       auth.DeviceIdentity
+	trust          *trust.Store
+	audit          *audit.Store
+	stateMu        sync.RWMutex
+	state          State
+	events         chan Event
+	cancel         context.CancelFunc
+	streamCancelMu sync.Mutex
+	streamCancel   context.CancelFunc
+	streamDone     chan struct{}
+	closed         chan struct{}
+	closeOnce      sync.Once
 
 	framesSent     atomic.Int64
 	framesReceived atomic.Int64
@@ -66,21 +73,22 @@ func (c *Client) Start(ctx context.Context) error {
 	c.cancel = cancel
 	c.rootCtx = ctx
 
-	identityPath := c.opts.IdentityPath
+	opts := c.optionsSnapshot()
+	identityPath := opts.IdentityPath
 	if identityPath == "" {
 		identityPath = filepath.Join(".", ".beacondesk", "device.json")
 	}
-	trustPath := c.opts.TrustStorePath
+	trustPath := opts.TrustStorePath
 	if trustPath == "" {
 		trustPath = filepath.Join(filepath.Dir(identityPath), "trusted-devices.json")
 	}
 	c.trust = trust.NewStore(trustPath)
-	auditPath := c.opts.AuditLogPath
+	auditPath := opts.AuditLogPath
 	if auditPath == "" {
 		auditPath = filepath.Join(filepath.Dir(identityPath), "audit-log.json")
 	}
 	c.audit = audit.NewStore(auditPath)
-	identity, err := auth.LoadOrCreateDeviceIdentity(identityPath, c.opts.DeviceName)
+	identity, err := auth.LoadOrCreateDeviceIdentity(identityPath, opts.DeviceName)
 	if err != nil {
 		return err
 	}
@@ -88,7 +96,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.setState(func(s *State) {
 		s.DeviceID = identity.DeviceID
 		s.DeviceName = identity.DeviceName
-		s.Role = c.opts.Role
+		s.Role = opts.Role
 	})
 
 	if err := c.connect(ctx); err != nil {
@@ -106,6 +114,7 @@ func (c *Client) Close() {
 		if c.cancel != nil {
 			c.cancel()
 		}
+		c.stopStreamLoop()
 		c.closeConn()
 		close(c.closed)
 	})
@@ -127,6 +136,180 @@ func (c *Client) State() State {
 	return out
 }
 
+func (c *Client) optionsSnapshot() Options {
+	c.optsMu.RLock()
+	defer c.optsMu.RUnlock()
+	return c.opts
+}
+
+func (c *Client) UpdateOptions(opts Options) {
+	opts = opts.withDefaults()
+	c.optsMu.Lock()
+	c.opts.ServerAddress = opts.ServerAddress
+	c.opts.Transport = opts.Transport
+	c.opts.UseTLS = opts.UseTLS
+	c.opts.WebSocketPath = opts.WebSocketPath
+	c.opts.TLSServerName = opts.TLSServerName
+	c.opts.TLSSkipVerify = opts.TLSSkipVerify
+	c.opts.TLSCertSHA256 = opts.TLSCertSHA256
+	c.opts.DeviceName = opts.DeviceName
+	c.opts.Role = opts.Role
+	c.opts.RequestMode = opts.RequestMode
+	c.opts.TargetDeviceID = opts.TargetDeviceID
+	c.opts.TargetAuthCode = opts.TargetAuthCode
+	c.opts.Token = opts.Token
+	c.opts.IdentityPath = opts.IdentityPath
+	c.opts.TrustStorePath = opts.TrustStorePath
+	c.opts.AuditLogPath = opts.AuditLogPath
+	c.opts.AutoAccept = opts.AutoAccept
+	c.opts.EnableInput = opts.EnableInput
+	c.opts.SendMockFrames = opts.SendMockFrames
+	c.opts.SendScreenFrames = opts.SendScreenFrames
+	c.opts.CaptureFPS = opts.CaptureFPS
+	c.opts.CaptureMaxWidth = opts.CaptureMaxWidth
+	c.opts.CaptureMaxHeight = opts.CaptureMaxHeight
+	c.opts.CaptureQuality = opts.CaptureQuality
+	c.opts.BandwidthLimitKbps = opts.BandwidthLimitKbps
+	c.opts.StaticFrameSeconds = opts.StaticFrameSeconds
+	c.opts.HeartbeatInterval = opts.HeartbeatInterval
+	c.opts.ReconnectMinDelay = opts.ReconnectMinDelay
+	c.opts.ReconnectMaxDelay = opts.ReconnectMaxDelay
+	c.opts.DisableReconnect = opts.DisableReconnect
+	c.optsMu.Unlock()
+
+	c.setState(func(s *State) {
+		s.DeviceName = opts.DeviceName
+		s.Role = opts.Role
+	})
+	c.restartStreamLoopForCurrentState(c.rootCtx)
+}
+
+func (c *Client) UpdateMediaOptions(payload protocol.StreamControlPayload) {
+	c.optsMu.Lock()
+	if payload.SendScreenFrames != nil {
+		c.opts.SendScreenFrames = *payload.SendScreenFrames
+		if *payload.SendScreenFrames {
+			c.opts.SendMockFrames = false
+		}
+	}
+	if payload.CaptureFPS > 0 {
+		c.opts.CaptureFPS = clamp(payload.CaptureFPS, 1, 120)
+	}
+	if payload.CaptureMaxWidth > 0 {
+		c.opts.CaptureMaxWidth = clamp(payload.CaptureMaxWidth, 320, 7680)
+	}
+	if payload.CaptureMaxHeight > 0 {
+		c.opts.CaptureMaxHeight = clamp(payload.CaptureMaxHeight, 240, 4320)
+	}
+	if payload.CaptureQuality > 0 {
+		c.opts.CaptureQuality = clamp(payload.CaptureQuality, 20, 90)
+	}
+	if payload.BandwidthLimitKbps > 0 {
+		c.opts.BandwidthLimitKbps = clamp(payload.BandwidthLimitKbps, 128, 200000)
+	}
+	if payload.StaticFrameSeconds > 0 {
+		c.opts.StaticFrameSeconds = clamp(payload.StaticFrameSeconds, 1, 300)
+	}
+	c.optsMu.Unlock()
+}
+
+func (c *Client) SendStreamControl(ctx context.Context, payload protocol.StreamControlPayload) error {
+	sessionID := c.activeSessionID()
+	if sessionID == "" {
+		return fmt.Errorf("no active session")
+	}
+	msg := protocol.MustEnvelope(protocol.TypeStreamControl, c.identity.DeviceID, "", payload)
+	msg.SessionID = sessionID
+	return c.write(ctx, msg)
+}
+
+func (c *Client) restartStreamLoopForCurrentState(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	state := c.State()
+	if state.SessionID == "" || !state.ShouldSendView {
+		c.stopStreamLoop()
+		return
+	}
+	c.startConfiguredStreamLoop(ctx, state.SessionID)
+}
+
+func (c *Client) startConfiguredStreamLoop(ctx context.Context, sessionID string) {
+	if ctx == nil || sessionID == "" {
+		return
+	}
+	c.stopStreamLoop()
+	opts := c.optionsSnapshot()
+	switch {
+	case opts.SendScreenFrames:
+		c.startStreamLoop(ctx, "screen-frame-loop", func(streamCtx context.Context) { c.screenFrameLoop(streamCtx, sessionID) })
+	case opts.SendMockFrames:
+		c.startStreamLoop(ctx, "mock-frame-loop", func(streamCtx context.Context) { c.mockFrameLoop(streamCtx, sessionID) })
+	default:
+		c.setState(func(s *State) {
+			s.LastFrameKind = protocol.StreamKindStatus
+			s.LastFrameStatus = screenSendingDisabledMessage
+			s.LastFrameError = ""
+			s.LastFrameData = ""
+			s.LastFrameWidth = 0
+			s.LastFrameHeight = 0
+		})
+		c.safeGo("stream-status", func() {
+			_ = c.streamStatus(ctx, sessionID, screenSendingDisabledMessage)
+		})
+		c.emit("screen.disabled", "screen frame sending is disabled")
+	}
+}
+
+func (c *Client) startStreamLoop(ctx context.Context, name string, fn func(context.Context)) {
+	if ctx == nil {
+		return
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	c.streamCancelMu.Lock()
+	oldCancel := c.streamCancel
+	oldDone := c.streamDone
+	c.streamCancel = cancel
+	c.streamDone = done
+	c.streamCancelMu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldDone != nil {
+		select {
+		case <-oldDone:
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			cancel()
+			return
+		}
+	}
+	c.safeGo(name, func() {
+		defer close(done)
+		fn(streamCtx)
+	})
+}
+
+func (c *Client) stopStreamLoop() {
+	c.streamCancelMu.Lock()
+	cancel := c.streamCancel
+	done := c.streamDone
+	c.streamCancel = nil
+	c.streamDone = nil
+	c.streamCancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func (c *Client) RequestSession(ctx context.Context, targetDeviceID string) error {
 	return c.RequestSessionWithCode(ctx, targetDeviceID, "")
 }
@@ -135,13 +318,14 @@ func (c *Client) RequestSessionWithCode(ctx context.Context, targetDeviceID stri
 	if targetDeviceID == "" {
 		return fmt.Errorf("target device id is required")
 	}
+	opts := c.optionsSnapshot()
 	msg := protocol.MustEnvelope(protocol.TypeSessionRequest, c.identity.DeviceID, targetDeviceID, protocol.SessionRequestPayload{
 		TargetDeviceID: targetDeviceID,
-		Mode:           c.opts.RequestMode,
+		Mode:           opts.RequestMode,
 		AuthCode:       authCode,
 		RequesterName:  c.identity.DeviceName,
-		RequesterRole:  c.opts.Role,
-		InputRequested: protocol.SessionModeAllowsInput(c.opts.RequestMode),
+		RequesterRole:  opts.Role,
+		InputRequested: protocol.SessionModeAllowsInput(opts.RequestMode),
 	})
 	c.emit("session.request", "requesting session with "+targetDeviceID)
 	return c.write(ctx, msg)
@@ -214,6 +398,7 @@ func (c *Client) approveSession(ctx context.Context, remember bool) error {
 	if pending == "" {
 		return fmt.Errorf("no pending session request")
 	}
+	opts := c.optionsSnapshot()
 	if remember && c.trust != nil {
 		if err := c.trust.Remember(pending, c.pendingMode()); err != nil {
 			return err
@@ -222,12 +407,12 @@ func (c *Client) approveSession(ctx context.Context, remember bool) error {
 	confirm := protocol.MustEnvelope(protocol.TypeSessionConfirm, c.identity.DeviceID, pending, protocol.SessionConfirmPayload{
 		Accepted:     true,
 		AcceptedMode: c.pendingMode(),
-		InputAllowed: c.pendingInput() && c.opts.EnableInput,
+		InputAllowed: c.pendingInput() && opts.EnableInput,
 	})
 	if err := c.write(ctx, confirm); err != nil {
 		return err
 	}
-	c.recordAudit("session.accepted", pending, "", c.pendingMode(), fmt.Sprintf("remember=%t input_allowed=%t", remember, c.pendingInput() && c.opts.EnableInput))
+	c.recordAudit("session.accepted", pending, "", c.pendingMode(), fmt.Sprintf("remember=%t input_allowed=%t", remember, c.pendingInput() && opts.EnableInput))
 	c.setState(func(s *State) {
 		clearPending(s)
 	})
@@ -299,24 +484,26 @@ func (c *Client) SendKeyboard(ctx context.Context, event input.KeyboardEvent) er
 }
 
 func (c *Client) register(ctx context.Context) error {
+	opts := c.optionsSnapshot()
 	msg := protocol.MustEnvelope(protocol.TypeDeviceRegister, c.identity.DeviceID, "relay", protocol.RegisterPayload{
 		DeviceID:   c.identity.DeviceID,
 		DeviceName: c.identity.DeviceName,
-		Role:       c.opts.Role,
-		Token:      c.opts.Token,
+		Role:       opts.Role,
+		Token:      opts.Token,
 	})
 	return c.write(ctx, msg)
 }
 
 func (c *Client) connect(ctx context.Context) error {
+	opts := c.optionsSnapshot()
 	conn, err := transport.Dial(ctx, transport.DialOptions{
-		Address:               c.opts.ServerAddress,
-		Transport:             c.opts.Transport,
-		EnableTLS:             c.opts.UseTLS,
-		WebSocketPath:         c.opts.WebSocketPath,
-		TLSServerName:         c.opts.TLSServerName,
-		TLSInsecureSkipVerify: c.opts.TLSSkipVerify,
-		TLSCertSHA256:         c.opts.TLSCertSHA256,
+		Address:               opts.ServerAddress,
+		Transport:             opts.Transport,
+		EnableTLS:             opts.UseTLS,
+		WebSocketPath:         opts.WebSocketPath,
+		TLSServerName:         opts.TLSServerName,
+		TLSInsecureSkipVerify: opts.TLSSkipVerify,
+		TLSCertSHA256:         opts.TLSCertSHA256,
 	})
 	if err != nil {
 		return err
@@ -337,7 +524,7 @@ func (c *Client) connect(ctx context.Context) error {
 		s.ConnectedAt = now
 		s.LastMessageAt = now
 	})
-	c.emit("transport.connected", fmt.Sprintf("connected to relay %s via %s", c.opts.ServerAddress, c.opts.Transport))
+	c.emit("transport.connected", fmt.Sprintf("connected to relay %s via %s", opts.ServerAddress, opts.Transport))
 	if err := c.register(ctx); err != nil {
 		c.closeConn()
 		return err
@@ -346,7 +533,8 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 func (c *Client) reconnect(ctx context.Context) error {
-	delay := c.opts.ReconnectMinDelay
+	opts := c.optionsSnapshot()
+	delay := opts.ReconnectMinDelay
 	for {
 		select {
 		case <-ctx.Done():
@@ -379,14 +567,16 @@ func (c *Client) reconnect(ctx context.Context) error {
 		}
 
 		if err := c.connect(ctx); err == nil {
-			c.emit("transport.reconnected", fmt.Sprintf("reconnected to relay %s via %s", c.opts.ServerAddress, c.opts.Transport))
+			opts = c.optionsSnapshot()
+			c.emit("transport.reconnected", fmt.Sprintf("reconnected to relay %s via %s", opts.ServerAddress, opts.Transport))
 			return nil
 		} else {
 			c.emit("transport.reconnect_failed", err.Error())
 		}
 		delay *= 2
-		if delay > c.opts.ReconnectMaxDelay {
-			delay = c.opts.ReconnectMaxDelay
+		opts = c.optionsSnapshot()
+		if delay > opts.ReconnectMaxDelay {
+			delay = opts.ReconnectMaxDelay
 		}
 	}
 }
@@ -398,6 +588,9 @@ func (c *Client) currentConn() transport.Conn {
 }
 
 func (c *Client) write(ctx context.Context, msg protocol.Envelope) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	conn := c.currentConn()
 	if conn == nil {
 		return fmt.Errorf("client is not connected")
@@ -415,6 +608,7 @@ func (c *Client) closeConn() {
 }
 
 func (c *Client) markDisconnected() {
+	c.stopStreamLoop()
 	c.closeConn()
 	c.setState(func(s *State) {
 		s.Connected = false
@@ -437,7 +631,7 @@ func (c *Client) readLoop(ctx context.Context) {
 			if ctx.Err() == nil {
 				c.emit("transport.closed", err.Error())
 				c.markDisconnected()
-				if c.opts.DisableReconnect {
+				if c.optionsSnapshot().DisableReconnect {
 					c.Close()
 					return
 				}
@@ -458,7 +652,7 @@ func (c *Client) readLoop(ctx context.Context) {
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(c.opts.HeartbeatInterval)
+	ticker := time.NewTicker(c.optionsSnapshot().HeartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -522,8 +716,9 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 			}
 		})
 		c.emit("device.registered", "registered as "+payload.DeviceID)
-		if c.opts.TargetDeviceID != "" {
-			return c.RequestSessionWithCode(ctx, c.opts.TargetDeviceID, c.opts.TargetAuthCode)
+		opts := c.optionsSnapshot()
+		if opts.TargetDeviceID != "" {
+			return c.RequestSessionWithCode(ctx, opts.TargetDeviceID, opts.TargetAuthCode)
 		}
 	case protocol.TypeAuthCodePublished:
 		payload, err := protocol.DecodePayload[protocol.AuthCodePublishedPayload](msg)
@@ -598,7 +793,8 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 			return err
 		}
 		shouldSendView := payload.ShouldSendView
-		if payload.LocalRole == "" && (c.opts.SendScreenFrames || c.opts.SendMockFrames) {
+		opts := c.optionsSnapshot()
+		if payload.LocalRole == "" && (opts.SendScreenFrames || opts.SendMockFrames) {
 			shouldSendView = true
 		}
 		c.setState(func(s *State) {
@@ -619,25 +815,9 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 		c.recordAudit("session.ready", payload.PeerID, payload.SessionID, payload.Mode, fmt.Sprintf("input_allowed=%t", payload.InputAllowed))
 		c.emit("session.ready", fmt.Sprintf("session ready with %s mode=%s input=%t role=%s", payload.PeerID, payload.Mode, payload.InputAllowed, payload.LocalRole))
 		if shouldSendView {
-			switch {
-			case c.opts.SendScreenFrames:
-				c.safeGo("screen-frame-loop", func() { c.screenFrameLoop(ctx, payload.SessionID) })
-			case c.opts.SendMockFrames:
-				c.safeGo("mock-frame-loop", func() { c.mockFrameLoop(ctx, payload.SessionID) })
-			default:
-				c.setState(func(s *State) {
-					s.LastFrameKind = protocol.StreamKindStatus
-					s.LastFrameStatus = "被控端尚未开启屏幕画面发送，请在被控端设置 -> 授权中开启“发送屏幕画面”。"
-					s.LastFrameError = ""
-					s.LastFrameData = ""
-					s.LastFrameWidth = 0
-					s.LastFrameHeight = 0
-				})
-				c.safeGo("stream-status", func() {
-					_ = c.streamStatus(ctx, payload.SessionID, "被控端尚未开启屏幕画面发送，请在被控端设置 -> 授权中开启“发送屏幕画面”。")
-				})
-				c.emit("screen.disabled", "screen frame sending is disabled")
-			}
+			c.startConfiguredStreamLoop(ctx, payload.SessionID)
+		} else {
+			c.stopStreamLoop()
 		}
 	case protocol.TypeStreamFrame:
 		payload, err := protocol.DecodePayload[protocol.StreamFramePayload](msg)
@@ -676,6 +856,8 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 		return c.handleInputMouse(msg)
 	case protocol.TypeInputKeyboard:
 		return c.handleInputKeyboard(msg)
+	case protocol.TypeStreamControl:
+		return c.handleStreamControl(ctx, msg)
 	case protocol.TypeTelemetryStats:
 		payload, err := protocol.DecodePayload[protocol.TelemetryPayload](msg)
 		if err != nil {
@@ -683,6 +865,7 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 		}
 		c.emit("telemetry.stats", fmt.Sprintf("peer rtt=%dms bitrate=%dkbps loss=%d/10000", payload.RTTMillis, payload.BitrateKbps, payload.PacketLossPermy))
 	case protocol.TypeSessionClose:
+		c.stopStreamLoop()
 		c.setState(func(s *State) {
 			clearSession(s)
 		})
@@ -700,7 +883,8 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 }
 
 func (c *Client) handleInputMouse(msg protocol.Envelope) error {
-	if !c.opts.EnableInput {
+	opts := c.optionsSnapshot()
+	if !opts.EnableInput {
 		c.emit("input.blocked", "blocked mouse input because remote input is disabled")
 		c.recordAudit("input.blocked", msg.From, msg.SessionID, "", "mouse")
 		return nil
@@ -727,7 +911,8 @@ func (c *Client) handleInputMouse(msg protocol.Envelope) error {
 }
 
 func (c *Client) handleInputKeyboard(msg protocol.Envelope) error {
-	if !c.opts.EnableInput {
+	opts := c.optionsSnapshot()
+	if !opts.EnableInput {
 		c.emit("input.blocked", "blocked keyboard input because remote input is disabled")
 		c.recordAudit("input.blocked", msg.From, msg.SessionID, "", "keyboard")
 		return nil
@@ -751,6 +936,22 @@ func (c *Client) handleInputKeyboard(msg protocol.Envelope) error {
 	})
 }
 
+func (c *Client) handleStreamControl(ctx context.Context, msg protocol.Envelope) error {
+	payload, err := protocol.DecodePayload[protocol.StreamControlPayload](msg)
+	if err != nil {
+		return err
+	}
+	c.UpdateMediaOptions(payload)
+	c.emit("stream.control", "updated stream controls")
+
+	state := c.State()
+	if state.SessionID == "" || !state.ShouldSendView {
+		return nil
+	}
+	c.startConfiguredStreamLoop(ctx, state.SessionID)
+	return nil
+}
+
 func (c *Client) handleSessionRequest(ctx context.Context, msg protocol.Envelope) error {
 	c.emit("session.incoming", "incoming request from "+msg.From)
 	payload, err := protocol.DecodePayload[protocol.SessionRequestPayload](msg)
@@ -759,6 +960,7 @@ func (c *Client) handleSessionRequest(ctx context.Context, msg protocol.Envelope
 	}
 	c.recordAudit("session.incoming", msg.From, "", protocol.NormalizeSessionMode(payload.Mode), fmt.Sprintf("name=%s input_requested=%t", payload.RequesterName, payload.InputRequested))
 	trusted := c.trust != nil && c.trust.IsTrusted(msg.From)
+	opts := c.optionsSnapshot()
 	c.setState(func(s *State) {
 		s.PendingPeerID = msg.From
 		s.PendingPeerName = payload.RequesterName
@@ -773,7 +975,7 @@ func (c *Client) handleSessionRequest(ctx context.Context, msg protocol.Envelope
 		c.emit("session.trusted", "auto-accepting trusted device "+msg.From)
 		return c.ApproveSession(ctx)
 	}
-	if !c.opts.AutoAccept {
+	if !opts.AutoAccept {
 		c.emit("session.waiting", "waiting for local approval from "+msg.From)
 		return nil
 	}
@@ -781,11 +983,12 @@ func (c *Client) handleSessionRequest(ctx context.Context, msg protocol.Envelope
 }
 
 func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
-	quality := c.opts.CaptureQuality
+	opts := c.optionsSnapshot()
+	quality := opts.CaptureQuality
 	capturer, err := desktop.NewCapturer(desktop.CaptureOptions{
-		FPS:       c.opts.CaptureFPS,
-		MaxWidth:  c.opts.CaptureMaxWidth,
-		MaxHeight: c.opts.CaptureMaxHeight,
+		FPS:       opts.CaptureFPS,
+		MaxWidth:  opts.CaptureMaxWidth,
+		MaxHeight: opts.CaptureMaxHeight,
 		Quality:   quality,
 	})
 	if err != nil {
@@ -802,13 +1005,13 @@ func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
 		return
 	}
 	defer capturer.Close()
-	currentFPS := c.opts.CaptureFPS
+	currentFPS := opts.CaptureFPS
 	c.setState(func(s *State) {
 		s.CaptureQuality = quality
 		s.CurrentFPS = currentFPS
 	})
 	detector := desktop.ChangeDetector{
-		StaticFrameInterval: time.Duration(c.opts.StaticFrameSeconds) * time.Second,
+		StaticFrameInterval: time.Duration(opts.StaticFrameSeconds) * time.Second,
 	}
 
 	ticker := time.NewTicker(frameInterval(currentFPS))
@@ -965,7 +1168,8 @@ func (c *Client) currentRTTMillis() int64 {
 }
 
 func (c *Client) adjustCaptureQuality(capturer desktop.Capturer, current int) int {
-	limit := int64(c.opts.BandwidthLimitKbps)
+	opts := c.optionsSnapshot()
+	limit := int64(opts.BandwidthLimitKbps)
 	if limit <= 0 {
 		return current
 	}
@@ -974,7 +1178,7 @@ func (c *Client) adjustCaptureQuality(capturer desktop.Capturer, current int) in
 	switch {
 	case bitrate > limit && current > 25:
 		next = current - 5
-	case bitrate < limit*6/10 && current < c.opts.CaptureQuality:
+	case bitrate < limit*6/10 && current < opts.CaptureQuality:
 		next = current + 2
 	}
 	if next == current {
@@ -996,7 +1200,8 @@ func (c *Client) adjustCaptureQuality(capturer desktop.Capturer, current int) in
 }
 
 func (c *Client) adjustCaptureFPS(current int) int {
-	maxFPS := c.opts.CaptureFPS
+	opts := c.optionsSnapshot()
+	maxFPS := opts.CaptureFPS
 	if maxFPS <= 1 {
 		c.setState(func(s *State) {
 			s.CurrentFPS = max(1, current)
@@ -1009,7 +1214,7 @@ func (c *Client) adjustCaptureFPS(current int) int {
 	bitrate := c.estimatedBitrateKbpsSince(c.connectedAt())
 	loss := c.packetLossPermyriad()
 	rtt := c.currentRTTMillis()
-	limit := int64(c.opts.BandwidthLimitKbps)
+	limit := int64(opts.BandwidthLimitKbps)
 	congested := (limit > 0 && bitrate > limit) || loss >= 500 || rtt >= 350
 	healthy := (limit <= 0 || bitrate < limit*6/10) && loss <= 100 && rtt < 180
 
@@ -1034,6 +1239,16 @@ func frameInterval(fps int) time.Duration {
 		fps = 1
 	}
 	return time.Second / time.Duration(fps)
+}
+
+func clamp(v int, minValue int, maxValue int) int {
+	if v < minValue {
+		return minValue
+	}
+	if v > maxValue {
+		return maxValue
+	}
+	return v
 }
 
 func (c *Client) setState(update func(*State)) {

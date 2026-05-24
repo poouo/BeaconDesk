@@ -24,22 +24,16 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/font"
-	"gioui.org/font/gofont"
-	"gioui.org/io/event"
-	"gioui.org/io/key"
-	"gioui.org/io/pointer"
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
-	"gioui.org/text"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 	"github.com/poouo/BeaconDesk/internal/audit"
 	coreclient "github.com/poouo/BeaconDesk/internal/client"
-	"github.com/poouo/BeaconDesk/internal/input"
 	"github.com/poouo/BeaconDesk/internal/protocol"
 	"github.com/poouo/BeaconDesk/internal/trust"
 	"github.com/poouo/BeaconDesk/internal/updatecheck"
@@ -201,49 +195,6 @@ type settingsWidgets struct {
 	webShareRowClicks []widget.Clickable
 }
 
-type remoteWindow struct {
-	app        *nativeApp
-	window     *app.Window
-	ops        op.Ops
-	theme      *material.Theme
-	pointerTag struct{}
-	keyTag     struct{}
-	closeBtn   widget.Clickable
-	lastButton string
-}
-
-type appColors struct {
-	bg       color.NRGBA
-	panel    color.NRGBA
-	panel2   color.NRGBA
-	card     color.NRGBA
-	text     color.NRGBA
-	muted    color.NRGBA
-	border   color.NRGBA
-	primary  color.NRGBA
-	primary2 color.NRGBA
-	success  color.NRGBA
-	warning  color.NRGBA
-	danger   color.NRGBA
-	ink      color.NRGBA
-}
-
-var palette = appColors{
-	bg:       rgb(0xf3f6fb),
-	panel:    rgb(0xffffff),
-	panel2:   rgb(0xeef5ff),
-	card:     rgb(0xffffff),
-	text:     rgb(0x16202a),
-	muted:    rgb(0x475467),
-	border:   rgb(0xcbd5e1),
-	primary:  rgb(0x2563eb),
-	primary2: rgb(0x0f9f8e),
-	success:  rgb(0x16a34a),
-	warning:  rgb(0xd97706),
-	danger:   rgb(0xdc2626),
-	ink:      rgb(0x0b1220),
-}
-
 func runNativeClient() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := newNativeApp(ctx, cancel)
@@ -282,18 +233,6 @@ func newNativeApp(ctx context.Context, cancel context.CancelFunc) *nativeApp {
 	return a
 }
 
-func newAppTheme() *material.Theme {
-	th := material.NewTheme()
-	th.Palette.Bg = palette.bg
-	th.Palette.Fg = palette.text
-	th.Palette.ContrastBg = palette.primary
-	th.Palette.ContrastFg = rgb(0xffffff)
-	th.TextSize = 15
-	th.Face = font.Typeface("Segoe UI, Microsoft YaHei UI, Microsoft YaHei, Noto Sans CJK SC, sans-serif")
-	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
-	return th
-}
-
 func (a *nativeApp) initSettingsEditors() {
 	editors := []*widget.Editor{
 		&a.settingsUI.serverEdit, &a.settingsUI.wsPathEdit, &a.settingsUI.tlsNameEdit, &a.settingsUI.tlsPinEdit,
@@ -318,10 +257,17 @@ func (a *nativeApp) run() error {
 	w := new(app.Window)
 	w.Option(
 		app.Title("BeaconDesk"),
-		app.Size(unit.Dp(1180), unit.Dp(760)),
-		app.MinSize(unit.Dp(980), unit.Dp(660)),
+		app.Size(unit.Dp(1200), unit.Dp(800)),
+		app.MinSize(unit.Dp(1000), unit.Dp(740)),
 	)
 	a.window = w
+
+	if hasSavedConfig() {
+		a.safeGo("auto-connect", func() {
+			time.Sleep(150 * time.Millisecond)
+			a.connect()
+		})
+	}
 
 	ticker := time.NewTicker(time.Second)
 	a.safeGo("main-window-ticker", func() {
@@ -419,7 +365,7 @@ func (a *nativeApp) layoutHeader(gtx layout.Context) layout.Dimensions {
 			col := palette.muted
 			if state.Connected {
 				text = a.tr("连接服务器已连接", "Server connected")
-				col = palette.success
+				col = palette.primary // 连通状态使用品牌主色
 			} else if state.Reconnecting {
 				text = a.tr("正在重连", "Reconnecting")
 				col = palette.warning
@@ -431,7 +377,7 @@ func (a *nativeApp) layoutHeader(gtx layout.Context) layout.Dimensions {
 			col := palette.muted
 			if state.Registered {
 				text = a.tr("已注册", "Registered")
-				col = palette.primary2
+				col = palette.success // 注册成功使用绿色
 			}
 			return statusPill(gtx, a.theme, text, col)
 		}),
@@ -445,9 +391,10 @@ func (a *nativeApp) layoutDevicePanel(gtx layout.Context) layout.Dimensions {
 	state := a.currentState()
 	settings := a.settingsSnapshot()
 	connected := a.hasClient()
-	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(18).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(14)}.Layout(gtx,
+	return roundedPanel(gtx, palette.card, 16, func(gtx layout.Context) layout.Dimensions {
+		drawStroke(gtx, gtx.Constraints.Min, palette.border, 12, 1)
+		return layout.UniformInset(24).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(20)}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return a.label(gtx, a.tr("本机设备", "This device"), 18, palette.text, font.SemiBold)
 				}),
@@ -509,9 +456,10 @@ func (a *nativeApp) layoutAssistPanel(gtx layout.Context) layout.Dimensions {
 	if requesting {
 		requestLabel = a.tr("请求中...", "Requesting...")
 	}
-	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(12)}.Layout(gtx,
+	return roundedPanel(gtx, palette.card, 16, func(gtx layout.Context) layout.Dimensions {
+		drawStroke(gtx, gtx.Constraints.Min, palette.border, 16, 1)
+		return layout.UniformInset(20).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(16)}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return sectionHeader(gtx, a.theme, a.tr("远程协助", "Remote assistance"), a.tr("输入对方设备 ID 和验证码，向对方发起透明授权请求。", "Enter the peer device ID and code to request an authorized session."))
 				}),
@@ -539,8 +487,9 @@ func (a *nativeApp) layoutApprovalPanel(gtx layout.Context) layout.Dimensions {
 	if state.PendingPeerID == "" {
 		return layout.Dimensions{}
 	}
-	return roundedPanel(gtx, color.NRGBA{R: 255, G: 251, B: 235, A: 255}, 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(14).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	return roundedPanel(gtx, color.NRGBA{R: 255, G: 251, B: 235, A: 255}, 12, func(gtx layout.Context) layout.Dimensions {
+		drawStroke(gtx, gtx.Constraints.Min, palette.warning, 12, 1)
+		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			peer := peerNameFromPending(state)
 			detail := fmt.Sprintf("%s · %s", peer, modeLabel(state.PendingMode, settings.Language))
 			if state.PendingInput {
@@ -574,9 +523,10 @@ func (a *nativeApp) layoutApprovalPanel(gtx layout.Context) layout.Dimensions {
 func (a *nativeApp) layoutSessionPanel(gtx layout.Context) layout.Dimensions {
 	state := a.currentState()
 	settings := a.settingsSnapshot()
-	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(14)}.Layout(gtx,
+	return roundedPanel(gtx, palette.card, 16, func(gtx layout.Context) layout.Dimensions {
+		drawStroke(gtx, gtx.Constraints.Min, palette.border, 16, 1)
+		return layout.UniformInset(20).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(18)}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					peer := valueOrDash(peerName(state))
 					if state.SessionID == "" {
@@ -629,9 +579,10 @@ func (a *nativeApp) layoutSessionPanel(gtx layout.Context) layout.Dimensions {
 }
 
 func (a *nativeApp) layoutEventsPanel(gtx layout.Context) layout.Dimensions {
-	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(10)}.Layout(gtx,
+	return roundedPanel(gtx, palette.card, 16, func(gtx layout.Context) layout.Dimensions {
+		drawStroke(gtx, gtx.Constraints.Min, palette.border, 16, 1)
+		return layout.UniformInset(20).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(12)}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return sectionHeader(gtx, a.theme, a.tr("事件", "Events"), a.tr("连接、授权、心跳、码流和输入事件会显示在这里。", "Connection, authorization, heartbeat, stream, and input events appear here."))
 				}),
@@ -693,32 +644,7 @@ func (a *nativeApp) connect() {
 	a.invalidate()
 
 	a.safeGo("connect", func() {
-		c := coreclient.New(coreclient.Options{
-			ServerAddress:      opts.ServerAddress,
-			Transport:          opts.Transport,
-			UseTLS:             opts.UseTLS,
-			WebSocketPath:      opts.WebSocketPath,
-			TLSServerName:      opts.TLSServerName,
-			TLSSkipVerify:      opts.TLSSkipVerify,
-			TLSCertSHA256:      opts.TLSCertSHA256,
-			DeviceName:         opts.DeviceName,
-			Role:               opts.Role,
-			RequestMode:        opts.RequestMode,
-			Token:              opts.Token,
-			IdentityPath:       defaultIdentityPath(opts.DeviceName),
-			TrustStorePath:     defaultTrustStorePath(),
-			AuditLogPath:       defaultAuditLogPath(),
-			AutoAccept:         opts.AutoAccept,
-			EnableInput:        opts.EnableInput,
-			SendMockFrames:     opts.SendMockFrames,
-			SendScreenFrames:   opts.SendScreenFrames,
-			CaptureFPS:         opts.CaptureFPS,
-			CaptureMaxWidth:    opts.CaptureMaxWidth,
-			CaptureMaxHeight:   opts.CaptureMaxHeight,
-			CaptureQuality:     opts.CaptureQuality,
-			BandwidthLimitKbps: opts.BandwidthLimitKbps,
-			StaticFrameSeconds: opts.StaticFrameSeconds,
-		}, a.logger)
+		c := coreclient.New(clientOptionsFromSettings(opts), a.logger)
 		if err := c.Start(a.ctx); err != nil {
 			a.setNotice(fmt.Sprintf("%s: %v", a.tr("连接失败", "Connection failed"), err), true)
 			a.invalidate()
@@ -1007,6 +933,10 @@ func (a *nativeApp) currentState() coreclient.State {
 func (a *nativeApp) frameSnapshot() (paint.ImageOp, image.Point, coreclient.State) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.client != nil {
+		a.state = a.client.State()
+		a.decodeLatestFrameLocked(a.state)
+	}
 	state := a.state
 	if state.LastFrameError == "" && a.lastFrameError != "" {
 		state.LastFrameError = a.lastFrameError
@@ -1113,253 +1043,10 @@ func (a *nativeApp) openRemoteWindow() {
 		window: new(app.Window),
 		theme:  newAppTheme(),
 	}
+	rw.initControls(a.settings)
 	a.remote = rw
 	a.mu.Unlock()
 	a.safeGo("remote-window", rw.run)
-}
-
-func (rw *remoteWindow) run() {
-	defer func() {
-		if r := recover(); r != nil {
-			rw.app.logger.Error("remote window panic", "panic", r, "stack", string(debug.Stack()))
-			rw.app.mu.Lock()
-			if rw.app.remote == rw {
-				rw.app.remote = nil
-			}
-			rw.app.mu.Unlock()
-			rw.app.invalidate()
-		}
-	}()
-	title := rw.app.tr("BeaconDesk 远程画面", "BeaconDesk Remote Screen")
-	rw.window.Option(app.Title(title), app.Size(unit.Dp(1024), unit.Dp(680)), app.MinSize(unit.Dp(720), unit.Dp(480)))
-	for {
-		switch e := rw.window.Event().(type) {
-		case app.DestroyEvent:
-			rw.app.mu.Lock()
-			if rw.app.remote == rw {
-				rw.app.remote = nil
-			}
-			rw.app.mu.Unlock()
-			return
-		case app.FrameEvent:
-			func() {
-				defer rw.app.recoverFrame("remote-frame")
-				rw.app.renderMu.Lock()
-				defer rw.app.renderMu.Unlock()
-				rw.ops.Reset()
-				gtx := app.NewContext(&rw.ops, e)
-				rw.layout(gtx)
-				e.Frame(gtx.Ops)
-			}()
-		}
-	}
-}
-
-func (rw *remoteWindow) layout(gtx layout.Context) layout.Dimensions {
-	for rw.closeBtn.Clicked(gtx) {
-		rw.window.Perform(system.ActionClose)
-	}
-	paint.Fill(gtx.Ops, rgb(0x111827))
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return rw.toolbar(gtx)
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return rw.screen(gtx)
-		}),
-	)
-}
-
-func (rw *remoteWindow) toolbar(gtx layout.Context) layout.Dimensions {
-	state := rw.app.currentState()
-	title := rw.app.tr("远程画面", "Remote Screen")
-	subtitle := rw.app.tr("仅在会话授权后显示画面和转发输入", "Video and input are available only after authorization")
-	if state.PeerID != "" {
-		subtitle = peerName(state)
-	}
-	return layout.UniformInset(12).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(12)}.Layout(gtx,
-			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(2)}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return labelWithTheme(gtx, rw.theme, title, 17, rgb(0xffffff), font.SemiBold)
-					}),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return labelWithTheme(gtx, rw.theme, subtitle, 12, rgb(0xa7b0c0), font.Normal)
-					}),
-				)
-			}),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return buttonWithTheme(gtx, rw.theme, &rw.closeBtn, rw.app.tr("关闭", "Close"), buttonDark, true)
-			}),
-		)
-	})
-}
-
-func (rw *remoteWindow) screen(gtx layout.Context) layout.Dimensions {
-	img, size, state := rw.app.frameSnapshot()
-	gtx.Constraints.Min = gtx.Constraints.Max
-	bounds := image.Rectangle{Max: gtx.Constraints.Max}
-	paint.FillShape(gtx.Ops, rgb(0x0b1020), clip.Rect(bounds).Op())
-	area := image.Rectangle{
-		Min: image.Pt(gtx.Dp(18), gtx.Dp(18)),
-		Max: bounds.Max.Sub(image.Pt(gtx.Dp(18), gtx.Dp(18))),
-	}
-	if area.Dx() < 1 || area.Dy() < 1 {
-		return layout.Dimensions{Size: bounds.Size()}
-	}
-
-	screenRect := area
-	if size.X > 0 && size.Y > 0 {
-		screenRect = fitRect(area, size)
-	}
-	frameErr := strings.TrimSpace(state.LastFrameError)
-	frameStatus := strings.TrimSpace(state.LastFrameStatus)
-
-	defer clip.Rect(area).Push(gtx.Ops).Pop()
-	if img.Size().X > 0 {
-		defer op.Offset(screenRect.Min).Push(gtx.Ops).Pop()
-		gtx2 := gtx
-		gtx2.Constraints = layout.Exact(screenRect.Size())
-		widget.Image{
-			Src:      img,
-			Fit:      widget.Contain,
-			Position: layout.Center,
-			Scale:    1.0 / gtx.Metric.PxPerDp,
-		}.Layout(gtx2)
-	} else {
-		paint.FillShape(gtx.Ops, rgb(0x182033), clip.UniformRRect(screenRect, gtx.Dp(8)).Op(gtx.Ops))
-		defer op.Offset(screenRect.Min).Push(gtx.Ops).Pop()
-		gtx2 := gtx
-		gtx2.Constraints = layout.Exact(screenRect.Size())
-		layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
-			msg := rw.app.tr("等待远程画面...", "Waiting for remote video...")
-			col := rgb(0xa7b0c0)
-			if state.SessionID == "" {
-				msg = rw.app.tr("暂无活动会话", "No active session")
-			} else if frameErr != "" {
-				msg = frameErr + "\n" + rw.app.tr("请确认被控端未锁屏、当前用户桌面可见，并已开启“发送屏幕画面”。", "Make sure the controlled desktop is unlocked, visible, and screen sending is enabled.")
-				col = rgb(0xfca5a5)
-			} else if frameStatus != "" {
-				msg = frameStatus
-				col = rgb(0xfcd34d)
-			} else if state.SessionLocalRole == protocol.RoleControlled {
-				msg = rw.app.tr("本机是被控端，正在把画面发送给对方。", "This device is controlled and is sending its screen.")
-			} else if state.FramesReceived == 0 {
-				msg = rw.app.tr("等待被控端发送第一帧画面。请在被控端设置 -> 授权中开启“发送屏幕画面”。", "Waiting for the controlled device to send the first frame. Enable screen sending on the controlled device.")
-			}
-			return labelWithTheme(gtx, rw.theme, msg, 15, col, font.Normal)
-		})
-	}
-
-	rw.handleRemoteInput(gtx, screenRect, size, state)
-	return layout.Dimensions{Size: bounds.Size()}
-}
-
-func (rw *remoteWindow) handleRemoteInput(gtx layout.Context, rect image.Rectangle, source image.Point, state coreclient.State) {
-	defer clip.Rect(rect).Push(gtx.Ops).Pop()
-	event.Op(gtx.Ops, &rw.pointerTag)
-	event.Op(gtx.Ops, &rw.keyTag)
-	if source.X <= 0 {
-		source.X = max(1, rect.Dx())
-	}
-	if source.Y <= 0 {
-		source.Y = max(1, rect.Dy())
-	}
-	for {
-		ev, ok := gtx.Event(pointer.Filter{
-			Target: &rw.pointerTag,
-			Kinds:  pointer.Press | pointer.Release | pointer.Move | pointer.Drag | pointer.Scroll,
-		})
-		if !ok {
-			break
-		}
-		pe := ev.(pointer.Event)
-		if pe.Kind == pointer.Press {
-			gtx.Execute(key.FocusCmd{Tag: &rw.keyTag})
-		}
-		if state.SessionID == "" || !state.InputAllowed {
-			continue
-		}
-		p := image.Pt(int(pe.Position.X), int(pe.Position.Y))
-		if !p.In(rect) && pe.Kind != pointer.Scroll {
-			continue
-		}
-		x := clampInt((p.X-rect.Min.X)*source.X/max(1, rect.Dx()), 0, source.X-1)
-		y := clampInt((p.Y-rect.Min.Y)*source.Y/max(1, rect.Dy()), 0, source.Y-1)
-		event := input.MouseEvent{X: x, Y: y, SourceWidth: source.X, SourceHeight: source.Y}
-		switch pe.Kind {
-		case pointer.Press:
-			rw.lastButton = pointerButtonName(pe.Buttons)
-			event.Button = valueOr(rw.lastButton, "left")
-			event.Action = "down"
-		case pointer.Release:
-			event.Button = valueOr(rw.lastButton, "left")
-			event.Action = "up"
-			rw.lastButton = ""
-		case pointer.Move, pointer.Drag:
-			event.Action = "move"
-		case pointer.Scroll:
-			event.Action = "wheel"
-			event.WheelDelta = int(-pe.Scroll.Y)
-		}
-		rw.sendMouse(event)
-	}
-	for {
-		ev, ok := gtx.Event(
-			key.FocusFilter{Target: &rw.keyTag},
-			key.Filter{Focus: &rw.keyTag, Name: ""},
-		)
-		if !ok {
-			break
-		}
-		ke, ok := ev.(key.Event)
-		if !ok || state.SessionID == "" || !state.InputAllowed {
-			continue
-		}
-		action := "down"
-		if ke.State == key.Release {
-			action = "up"
-		}
-		rw.sendKeyboard(input.KeyboardEvent{
-			Key:       string(ke.Name),
-			Code:      gioKeyCode(ke.Name),
-			KeyCode:   gioVirtualKey(ke.Name),
-			Action:    action,
-			Modifiers: gioModifiers(ke.Modifiers),
-		})
-	}
-	pointer.CursorCrosshair.Add(gtx.Ops)
-}
-
-func (rw *remoteWindow) sendMouse(event input.MouseEvent) {
-	c := rw.app.currentClient()
-	if c == nil {
-		return
-	}
-	rw.app.safeGo("send-mouse", func() {
-		ctx, cancel := context.WithTimeout(rw.app.ctx, 2*time.Second)
-		defer cancel()
-		if err := c.SendMouse(ctx, event); err != nil {
-			rw.app.setNotice(fmt.Sprintf("%s: %v", rw.app.tr("鼠标事件发送失败", "Mouse event failed"), err), true)
-			rw.app.invalidate()
-		}
-	})
-}
-
-func (rw *remoteWindow) sendKeyboard(event input.KeyboardEvent) {
-	c := rw.app.currentClient()
-	if c == nil {
-		return
-	}
-	rw.app.safeGo("send-keyboard", func() {
-		ctx, cancel := context.WithTimeout(rw.app.ctx, 2*time.Second)
-		defer cancel()
-		if err := c.SendKeyboard(ctx, event); err != nil {
-			rw.app.setNotice(fmt.Sprintf("%s: %v", rw.app.tr("键盘事件发送失败", "Keyboard event failed"), err), true)
-			rw.app.invalidate()
-		}
-	})
 }
 
 func (a *nativeApp) openSettings() {
@@ -1897,8 +1584,16 @@ func (a *nativeApp) saveSettings() {
 		a.settings = next
 		a.english.Store(next.Language == "en")
 		a.showSettings = false
-		a.setNoticeLocked(a.tr("设置已保存到本地配置文件，新的连接会使用这些配置。", "Settings saved to local config. New connections will use these values."), false)
+		if a.remote != nil {
+			a.remote.initControls(next)
+		}
+		c := a.client
+		a.setNoticeLocked(a.tr("设置已保存，当前连接会立即应用可实时生效的参数。", "Settings saved. Runtime settings apply to the current connection immediately."), false)
 		a.mu.Unlock()
+		if c != nil {
+			c.UpdateOptions(clientOptionsFromSettings(next))
+			a.applyState(c.State())
+		}
 		a.invalidate()
 	})
 }
@@ -2217,308 +1912,6 @@ func (a *nativeApp) radioRow(gtx layout.Context, label string, group *widget.Enu
 	)
 }
 
-type buttonKind int
-
-const (
-	buttonPrimary buttonKind = iota
-	buttonSecondary
-	buttonAccent
-	buttonDanger
-	buttonDark
-)
-
-func (a *nativeApp) button(gtx layout.Context, b *widget.Clickable, txt string, kind buttonKind, enabled bool) layout.Dimensions {
-	return buttonWithTheme(gtx, a.theme, b, txt, kind, enabled)
-}
-
-func buttonWithTheme(gtx layout.Context, th *material.Theme, b *widget.Clickable, txt string, kind buttonKind, enabled bool) layout.Dimensions {
-	style := material.Button(th, b, txt)
-	style.CornerRadius = 8
-	style.Inset = layout.Inset{Top: 9, Bottom: 9, Left: 14, Right: 14}
-	style.TextSize = 13
-	style.Font.Weight = font.SemiBold
-	switch kind {
-	case buttonSecondary:
-		style.Background = rgb(0xe9eef7)
-		style.Color = palette.text
-	case buttonAccent:
-		style.Background = palette.primary2
-		style.Color = rgb(0xffffff)
-	case buttonDanger:
-		style.Background = palette.danger
-		style.Color = rgb(0xffffff)
-	case buttonDark:
-		style.Background = rgb(0x1f2937)
-		style.Color = rgb(0xffffff)
-	default:
-		style.Background = palette.primary
-		style.Color = rgb(0xffffff)
-	}
-	if !enabled {
-		gtx = gtx.Disabled()
-		style.Background = rgb(0xe5e7eb)
-		style.Color = rgb(0x98a2b3)
-	}
-	return style.Layout(gtx)
-}
-
-func (a *nativeApp) inputField(gtx layout.Context, ed *widget.Editor, hint string) layout.Dimensions {
-	return roundedPanel(gtx, rgb(0xffffff), 8, func(gtx layout.Context) layout.Dimensions {
-		drawStroke(gtx, gtx.Constraints.Min, palette.border, 8, 1)
-		return layout.Inset{Top: 10, Bottom: 10, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			st := material.Editor(a.theme, ed, hint)
-			st.TextSize = 14
-			st.Color = palette.text
-			st.HintColor = rgb(0x667085)
-			return st.Layout(gtx)
-		})
-	})
-}
-
-func (a *nativeApp) label(gtx layout.Context, txt string, size unit.Sp, col color.NRGBA, weight font.Weight) layout.Dimensions {
-	return labelWithTheme(gtx, a.theme, txt, size, col, weight)
-}
-
-func labelWithTheme(gtx layout.Context, th *material.Theme, txt string, size unit.Sp, col color.NRGBA, weight font.Weight) layout.Dimensions {
-	l := material.Label(th, size, txt)
-	l.Color = col
-	l.Font.Weight = weight
-	l.WrapPolicy = text.WrapWords
-	return l.Layout(gtx)
-}
-
-func (a *nativeApp) tr(zh, en string) string {
-	if a.english.Load() {
-		return en
-	}
-	return zh
-}
-
-func roundedPanel(gtx layout.Context, bg color.NRGBA, radius int, content layout.Widget) layout.Dimensions {
-	return layout.Background{}.Layout(gtx,
-		func(gtx layout.Context) layout.Dimensions {
-			paint.FillShape(gtx.Ops, bg, clip.UniformRRect(image.Rectangle{Max: gtx.Constraints.Min}, radius).Op(gtx.Ops))
-			return layout.Dimensions{Size: gtx.Constraints.Min}
-		},
-		content,
-	)
-}
-
-func sectionHeader(gtx layout.Context, th *material.Theme, title, subtitle string) layout.Dimensions {
-	return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(3)}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(th, 16, title)
-			l.Font.Weight = font.SemiBold
-			l.Color = palette.text
-			return l.Layout(gtx)
-		}),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(th, 12, subtitle)
-			l.Color = palette.muted
-			l.WrapPolicy = text.WrapWords
-			return l.Layout(gtx)
-		}),
-	)
-}
-
-func pageTitle(gtx layout.Context, th *material.Theme, title string) layout.Dimensions {
-	l := material.Label(th, 20, title)
-	l.Font.Weight = font.SemiBold
-	l.Color = palette.text
-	return l.Layout(gtx)
-}
-
-func statusPill(gtx layout.Context, th *material.Theme, txt string, col color.NRGBA) layout.Dimensions {
-	return roundedPanel(gtx, withAlpha(col, 30), 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.Inset{Top: 7, Bottom: 7, Left: 10, Right: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(th, 12, txt)
-			l.Font.Weight = font.SemiBold
-			l.Color = col
-			return l.Layout(gtx)
-		})
-	})
-}
-
-func infoBlock(gtx layout.Context, th *material.Theme, title, value string, mono bool) layout.Dimensions {
-	return roundedPanel(gtx, rgb(0xf8fafc), 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.Inset{Top: 12, Bottom: 12, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(4)}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					l := material.Label(th, 12, title)
-					l.Color = palette.muted
-					l.Font.Weight = font.SemiBold
-					return l.Layout(gtx)
-				}),
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					l := material.Label(th, 18, value)
-					l.Color = palette.text
-					l.Font.Weight = font.SemiBold
-					if mono {
-						l.Font.Typeface = font.Typeface("Cascadia Mono, Consolas, monospace")
-					}
-					l.WrapPolicy = text.WrapWords
-					return l.Layout(gtx)
-				}),
-			)
-		})
-	})
-}
-
-func noticeBox(gtx layout.Context, th *material.Theme, msg string, col color.NRGBA) layout.Dimensions {
-	return roundedPanel(gtx, withAlpha(col, 22), 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.Inset{Top: 10, Bottom: 10, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			l := material.Label(th, 12, msg)
-			l.Color = col
-			l.WrapPolicy = text.WrapWords
-			return l.Layout(gtx)
-		})
-	})
-}
-
-func metricTile(gtx layout.Context, th *material.Theme, title, value string) layout.Dimensions {
-	return roundedPanel(gtx, rgb(0xf8fafc), 8, func(gtx layout.Context) layout.Dimensions {
-		return layout.Inset{Top: 10, Bottom: 10, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(4)}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					l := material.Label(th, 11, title)
-					l.Color = palette.muted
-					l.Font.Weight = font.SemiBold
-					return l.Layout(gtx)
-				}),
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					l := material.Label(th, 15, valueOrDash(value))
-					l.Color = palette.text
-					l.Font.Weight = font.SemiBold
-					l.MaxLines = 1
-					return l.Layout(gtx)
-				}),
-			)
-		})
-	})
-}
-
-func navButton(gtx layout.Context, th *material.Theme, b *widget.Clickable, txt string, selected bool) layout.Dimensions {
-	bg := rgb(0xf8fafc)
-	fg := rgb(0x334155)
-	if selected {
-		bg = palette.primary
-		fg = rgb(0xffffff)
-	}
-	return material.Clickable(gtx, b, func(gtx layout.Context) layout.Dimensions {
-		return roundedPanel(gtx, bg, 8, func(gtx layout.Context) layout.Dimensions {
-			if !selected {
-				drawStroke(gtx, gtx.Constraints.Min, rgb(0xe2e8f0), 8, 1)
-			}
-			return layout.Inset{Top: 11, Bottom: 11, Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				l := material.Label(th, 14, txt)
-				l.Color = fg
-				l.Font.Weight = font.SemiBold
-				l.MaxLines = 1
-				return l.Layout(gtx)
-			})
-		})
-	})
-}
-
-func clickableSurface(gtx layout.Context, b *widget.Clickable, bg color.NRGBA, radius int, content layout.Widget) layout.Dimensions {
-	return material.Clickable(gtx, b, func(gtx layout.Context) layout.Dimensions {
-		return roundedPanel(gtx, bg, radius, func(gtx layout.Context) layout.Dimensions {
-			return content(gtx)
-		})
-	})
-}
-
-func radioPill(gtx layout.Context, th *material.Theme, group *widget.Enum, keyValue, label string) layout.Dimensions {
-	group.Update(gtx)
-	selected := group.Value == keyValue
-	return group.Layout(gtx, keyValue, func(gtx layout.Context) layout.Dimensions {
-		bg := rgb(0xf8fafc)
-		fg := rgb(0x334155)
-		if selected {
-			bg = withAlpha(palette.primary, 28)
-			fg = palette.primary
-		}
-		return roundedPanel(gtx, bg, 8, func(gtx layout.Context) layout.Dimensions {
-			if !selected {
-				drawStroke(gtx, gtx.Constraints.Min, rgb(0xe2e8f0), 8, 1)
-			}
-			return layout.Inset{Top: 8, Bottom: 8, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				l := material.Label(th, 13, label)
-				l.Color = fg
-				l.Font.Weight = font.SemiBold
-				l.MaxLines = 1
-				return l.Layout(gtx)
-			})
-		})
-	})
-}
-
-func rowButton(gtx layout.Context, th *material.Theme, b *widget.Clickable, txt string, selected bool) layout.Dimensions {
-	bg := rgb(0xf8fafc)
-	if selected {
-		bg = withAlpha(palette.primary2, 30)
-	}
-	return layout.Inset{Bottom: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return clickableSurface(gtx, b, bg, 8, func(gtx layout.Context) layout.Dimensions {
-			if !selected {
-				drawStroke(gtx, gtx.Constraints.Min, rgb(0xe2e8f0), 8, 1)
-			}
-			return layout.Inset{Top: 10, Bottom: 10, Left: 12, Right: 12}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				l := material.Label(th, 12, txt)
-				l.Color = palette.text
-				l.WrapPolicy = text.WrapWords
-				return l.Layout(gtx)
-			})
-		})
-	})
-}
-
-func emptyState(gtx layout.Context, th *material.Theme, txt string) layout.Dimensions {
-	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		l := material.Label(th, 14, txt)
-		l.Color = palette.muted
-		return l.Layout(gtx)
-	})
-}
-
-func logoMark(gtx layout.Context, size image.Point) layout.Dimensions {
-	gtx.Constraints = layout.Exact(size)
-	paint.FillShape(gtx.Ops, palette.primary, clip.UniformRRect(image.Rectangle{Max: size}, gtx.Dp(8)).Op(gtx.Ops))
-	in := gtx.Dp(8)
-	rect := image.Rectangle{Min: image.Pt(in, in), Max: size.Sub(image.Pt(in, in))}
-	paint.FillShape(gtx.Ops, rgb(0xffffff), clip.UniformRRect(rect, gtx.Dp(4)).Op(gtx.Ops))
-	inner := image.Rectangle{Min: rect.Min.Add(image.Pt(gtx.Dp(5), gtx.Dp(5))), Max: rect.Max.Sub(image.Pt(gtx.Dp(5), gtx.Dp(5)))}
-	paint.FillShape(gtx.Ops, palette.primary2, clip.UniformRRect(inner, gtx.Dp(3)).Op(gtx.Ops))
-	return layout.Dimensions{Size: size}
-}
-
-func drawStroke(gtx layout.Context, size image.Point, col color.NRGBA, radius int, width float32) {
-	if size.X <= 0 || size.Y <= 0 {
-		return
-	}
-	path := clip.UniformRRect(image.Rectangle{Max: size}, radius).Path(gtx.Ops)
-	paint.FillShape(gtx.Ops, col, clip.Stroke{Path: path, Width: width}.Op())
-}
-
-func withWidth(gtx layout.Context, width int, child layout.Widget) layout.Dimensions {
-	gtx.Constraints.Min.X = width
-	gtx.Constraints.Max.X = width
-	return child(gtx)
-}
-
-func wrapFlex(gtx layout.Context, children []layout.FlexChild, gap int) layout.Dimensions {
-	const maxPerRow = 4
-	rows := make([]layout.FlexChild, 0, (len(children)+maxPerRow-1)/maxPerRow)
-	for start := 0; start < len(children); start += maxPerRow {
-		end := min(start+maxPerRow, len(children))
-		rowChildren := append([]layout.FlexChild(nil), children[start:end]...)
-		rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Horizontal, Gap: gap}.Layout(gtx, rowChildren...)
-		}))
-	}
-	return layout.Flex{Axis: layout.Vertical, Gap: gap}.Layout(gtx, rows...)
-}
-
 func decodeFrameImage(dataURL string) (image.Image, error) {
 	_, raw, ok := strings.Cut(dataURL, ",")
 	if !ok {
@@ -2560,6 +1953,11 @@ func appLogPath() string {
 	return filepath.Join(executableDir(), "beacondesk-client.log")
 }
 
+func hasSavedConfig() bool {
+	info, err := os.Stat(appConfigPath())
+	return err == nil && !info.IsDir()
+}
+
 func loadUISettings() uiSettings {
 	settings := defaultUISettings()
 	b, err := os.ReadFile(appConfigPath())
@@ -2582,6 +1980,35 @@ func saveUISettings(settings uiSettings) error {
 		return err
 	}
 	return os.WriteFile(appConfigPath(), b, 0o600)
+}
+
+func clientOptionsFromSettings(settings uiSettings) coreclient.Options {
+	return coreclient.Options{
+		ServerAddress:      settings.ServerAddress,
+		Transport:          settings.Transport,
+		UseTLS:             settings.UseTLS,
+		WebSocketPath:      settings.WebSocketPath,
+		TLSServerName:      settings.TLSServerName,
+		TLSSkipVerify:      settings.TLSSkipVerify,
+		TLSCertSHA256:      settings.TLSCertSHA256,
+		DeviceName:         settings.DeviceName,
+		Role:               settings.Role,
+		RequestMode:        settings.RequestMode,
+		Token:              settings.Token,
+		IdentityPath:       defaultIdentityPath(settings.DeviceName),
+		TrustStorePath:     defaultTrustStorePath(),
+		AuditLogPath:       defaultAuditLogPath(),
+		AutoAccept:         settings.AutoAccept,
+		EnableInput:        settings.EnableInput,
+		SendMockFrames:     settings.SendMockFrames,
+		SendScreenFrames:   settings.SendScreenFrames,
+		CaptureFPS:         settings.CaptureFPS,
+		CaptureMaxWidth:    settings.CaptureMaxWidth,
+		CaptureMaxHeight:   settings.CaptureMaxHeight,
+		CaptureQuality:     settings.CaptureQuality,
+		BandwidthLimitKbps: settings.BandwidthLimitKbps,
+		StaticFrameSeconds: settings.StaticFrameSeconds,
+	}
 }
 
 func normalizeUISettings(settings uiSettings) uiSettings {
@@ -2784,6 +2211,23 @@ func stateInputText(state coreclient.State, language string) string {
 		return "Not Allowed"
 	}
 	return "未允许"
+}
+
+func sessionRoleLabel(role string, language string) string {
+	switch role {
+	case protocol.RoleController:
+		if language == "en" {
+			return "Controller"
+		}
+		return "主控"
+	case protocol.RoleControlled:
+		if language == "en" {
+			return "Controlled"
+		}
+		return "被控"
+	default:
+		return "-"
+	}
 }
 
 func peerName(state coreclient.State) string {
@@ -2998,147 +2442,6 @@ func ensureClicks(clicks *[]widget.Clickable, n int) {
 		return
 	}
 	*clicks = append(*clicks, make([]widget.Clickable, n-len(*clicks))...)
-}
-
-func rgb(c uint32) color.NRGBA {
-	return color.NRGBA{A: 255, R: uint8(c >> 16), G: uint8(c >> 8), B: uint8(c)}
-}
-
-func withAlpha(c color.NRGBA, alpha uint8) color.NRGBA {
-	c.A = alpha
-	return c
-}
-
-func fitRect(area image.Rectangle, src image.Point) image.Rectangle {
-	if src.X <= 0 || src.Y <= 0 || area.Dx() <= 0 || area.Dy() <= 0 {
-		return area
-	}
-	w := area.Dx()
-	h := w * src.Y / src.X
-	if h > area.Dy() {
-		h = area.Dy()
-		w = h * src.X / src.Y
-	}
-	x := area.Min.X + (area.Dx()-w)/2
-	y := area.Min.Y + (area.Dy()-h)/2
-	return image.Rect(x, y, x+w, y+h)
-}
-
-func pointerButtonName(buttons pointer.Buttons) string {
-	switch {
-	case buttons.Contain(pointer.ButtonSecondary):
-		return "right"
-	case buttons.Contain(pointer.ButtonTertiary):
-		return "middle"
-	case buttons.Contain(pointer.ButtonPrimary):
-		return "left"
-	default:
-		return "left"
-	}
-}
-
-func gioKeyCode(name key.Name) string {
-	s := string(name)
-	if len(s) == 1 {
-		ch := s[0]
-		if ch >= 'A' && ch <= 'Z' {
-			return "Key" + s
-		}
-		if ch >= '0' && ch <= '9' {
-			return "Digit" + s
-		}
-	}
-	switch name {
-	case key.NameReturn, key.NameEnter:
-		return "Enter"
-	case key.NameEscape:
-		return "Escape"
-	case key.NameDeleteBackward:
-		return "Backspace"
-	case key.NameDeleteForward:
-		return "Delete"
-	case key.NameTab:
-		return "Tab"
-	case key.NameSpace:
-		return "Space"
-	case key.NameLeftArrow:
-		return "ArrowLeft"
-	case key.NameRightArrow:
-		return "ArrowRight"
-	case key.NameUpArrow:
-		return "ArrowUp"
-	case key.NameDownArrow:
-		return "ArrowDown"
-	case key.NameHome:
-		return "Home"
-	case key.NameEnd:
-		return "End"
-	case key.NamePageUp:
-		return "PageUp"
-	case key.NamePageDown:
-		return "PageDown"
-	default:
-		return s
-	}
-}
-
-func gioVirtualKey(name key.Name) int {
-	s := string(name)
-	if len(s) == 1 {
-		ch := s[0]
-		if ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' {
-			return int(ch)
-		}
-	}
-	switch name {
-	case key.NameReturn, key.NameEnter:
-		return 0x0D
-	case key.NameEscape:
-		return 0x1B
-	case key.NameDeleteBackward:
-		return 0x08
-	case key.NameDeleteForward:
-		return 0x2E
-	case key.NameTab:
-		return 0x09
-	case key.NameSpace:
-		return 0x20
-	case key.NameLeftArrow:
-		return 0x25
-	case key.NameUpArrow:
-		return 0x26
-	case key.NameRightArrow:
-		return 0x27
-	case key.NameDownArrow:
-		return 0x28
-	case key.NameHome:
-		return 0x24
-	case key.NameEnd:
-		return 0x23
-	case key.NamePageUp:
-		return 0x21
-	case key.NamePageDown:
-		return 0x22
-	default:
-		return 0
-	}
-}
-
-func gioModifiers(mods key.Modifiers) []string {
-	out := []string{}
-	if mods.Contain(key.ModCtrl) {
-		out = append(out, "ctrl")
-	}
-	if mods.Contain(key.ModAlt) {
-		out = append(out, "alt")
-	}
-	if mods.Contain(key.ModShift) {
-		out = append(out, "shift")
-	}
-	if mods.Contain(key.ModSuper) {
-		out = append(out, "super")
-	}
-	return out
 }
 
 func clampInt(v, minValue, maxValue int) int {

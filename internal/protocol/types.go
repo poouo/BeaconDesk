@@ -21,6 +21,7 @@ const (
 	TypeSessionReady       = "session.ready"
 	TypeSessionClose       = "session.close"
 	TypeStreamFrame        = "stream.frame"
+	TypeStreamControl      = "stream.control"
 	TypeInputMouse         = "input.mouse"
 	TypeInputKeyboard      = "input.keyboard"
 	TypeTelemetryStats     = "telemetry.stats"

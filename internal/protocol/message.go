@@ -166,6 +166,16 @@ type StreamFramePayload struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+type StreamControlPayload struct {
+	SendScreenFrames   *bool `json:"send_screen_frames,omitempty"`
+	CaptureFPS         int   `json:"capture_fps,omitempty"`
+	CaptureMaxWidth    int   `json:"capture_max_width,omitempty"`
+	CaptureMaxHeight   int   `json:"capture_max_height,omitempty"`
+	CaptureQuality     int   `json:"capture_quality,omitempty"`
+	BandwidthLimitKbps int   `json:"bandwidth_limit_kbps,omitempty"`
+	StaticFrameSeconds int   `json:"static_frame_seconds,omitempty"`
+}
+
 type InputMousePayload struct {
 	X            int    `json:"x"`
 	Y            int    `json:"y"`

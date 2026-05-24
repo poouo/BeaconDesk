@@ -266,6 +266,8 @@ func (s *Server) handleMessage(ctx context.Context, client *Client, msg protocol
 		return s.handleSessionConfirm(client, msg)
 	case protocol.TypeStreamFrame:
 		return s.forwardSessionMessage(client, msg)
+	case protocol.TypeStreamControl:
+		return s.forwardStreamControlMessage(client, msg)
 	case protocol.TypeInputMouse:
 		return s.forwardInputMessage(client, msg)
 	case protocol.TypeInputKeyboard:
@@ -533,6 +535,17 @@ func (s *Server) forwardInputMessage(client *Client, msg protocol.Envelope) erro
 	}
 	if client.deviceID != session.ControllerID {
 		return fmt.Errorf("only controller can send input for session %s", session.ID)
+	}
+	return s.forwardSessionMessage(client, msg)
+}
+
+func (s *Server) forwardStreamControlMessage(client *Client, msg protocol.Envelope) error {
+	session := s.getSession(msg.SessionID)
+	if session == nil {
+		return fmt.Errorf("session %s not found", msg.SessionID)
+	}
+	if client.deviceID != session.ControllerID {
+		return fmt.Errorf("only controller can update stream controls for session %s", session.ID)
 	}
 	return s.forwardSessionMessage(client, msg)
 }
