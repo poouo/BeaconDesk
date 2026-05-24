@@ -338,6 +338,7 @@ func (s *Server) handleRegister(ctx context.Context, client *Client, msg protoco
 
 	registered := protocol.MustEnvelope(protocol.TypeDeviceRegistered, "relay", client.deviceID, protocol.RegisteredPayload{
 		DeviceID:   client.deviceID,
+		DeviceName: client.deviceName,
 		ServerTime: time.Now().UnixMilli(),
 		Message:    "registered",
 	})
@@ -358,7 +359,7 @@ func (s *Server) handlePing(ctx context.Context, client *Client, msg protocol.En
 
 func (s *Server) handleSessionRequest(client *Client, msg protocol.Envelope) error {
 	if client.deviceID == "" {
-		return fmt.Errorf("device is not registered")
+		return fmt.Errorf("requesting device is not registered yet")
 	}
 	payload, err := protocol.DecodePayload[protocol.SessionRequestPayload](msg)
 	if err != nil {
@@ -458,12 +459,14 @@ func (s *Server) handleSessionConfirm(client *Client, msg protocol.Envelope) err
 	}
 
 	toController := protocol.MustEnvelope(protocol.TypeSessionReady, "relay", controllerID, protocol.SessionReadyPayload{
-		SessionID:    session.ID,
-		PeerID:       client.deviceID,
-		PeerName:     client.deviceName,
-		Mode:         session.Mode,
-		RelayRoute:   true,
-		InputAllowed: session.InputAllowed,
+		SessionID:      session.ID,
+		PeerID:         client.deviceID,
+		PeerName:       client.deviceName,
+		Mode:           session.Mode,
+		RelayRoute:     true,
+		InputAllowed:   session.InputAllowed,
+		LocalRole:      protocol.RoleController,
+		ShouldSendView: false,
 	})
 	toController.SessionID = session.ID
 	var targetPeerID, targetPeerName string
@@ -475,12 +478,14 @@ func (s *Server) handleSessionConfirm(client *Client, msg protocol.Envelope) err
 		targetPeerName = webPeer.name
 	}
 	toTarget := protocol.MustEnvelope(protocol.TypeSessionReady, "relay", client.deviceID, protocol.SessionReadyPayload{
-		SessionID:    session.ID,
-		PeerID:       targetPeerID,
-		PeerName:     targetPeerName,
-		Mode:         session.Mode,
-		RelayRoute:   true,
-		InputAllowed: session.InputAllowed,
+		SessionID:      session.ID,
+		PeerID:         targetPeerID,
+		PeerName:       targetPeerName,
+		Mode:           session.Mode,
+		RelayRoute:     true,
+		InputAllowed:   session.InputAllowed,
+		LocalRole:      protocol.RoleControlled,
+		ShouldSendView: true,
 	})
 	toTarget.SessionID = session.ID
 

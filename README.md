@@ -82,6 +82,14 @@ tls_key_file = "/etc/beacondesk/tls/privkey.pem"
 allow_insecure_plaintext = false
 ```
 
+安装脚本默认会生成自签名证书，所以 Windows 客户端如果开启证书校验，可能提示 `certificate signed by unknown authority`。推荐方案是给中转服务器配置域名和 Let’s Encrypt 等可信证书。临时使用自签证书时，不建议长期打开“跳过 TLS 证书校验”，可以在服务器查看证书 SHA256 指纹：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/install.sh | sudo sh -s -- fingerprint
+```
+
+然后在 Windows 客户端“设置 -> 连接 -> TLS 证书指纹”中填入该值，保持“使用 TLS”开启，并关闭“跳过 TLS 证书校验”。
+
 网页控制链接由服务端提供。在 WebSocket 模式下，`/web` 和 `/ws` 复用同一个 HTTP 监听端口。TCP 模式下可以额外开启：
 
 ```text
@@ -187,6 +195,12 @@ curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/insta
 curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/install.sh | sudo sh -s -- stop
 curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/install.sh | sudo sh -s -- restart
 curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/install.sh | sudo sh -s -- status
+```
+
+查看当前 TLS 证书 SHA256 指纹：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/poouo/BeaconDesk/main/scripts/install.sh | sudo sh -s -- fingerprint
 ```
 
 升级：

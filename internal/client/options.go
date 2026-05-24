@@ -13,6 +13,7 @@ type Options struct {
 	WebSocketPath      string
 	TLSServerName      string
 	TLSSkipVerify      bool
+	TLSCertSHA256      string
 	DeviceName         string
 	Role               string
 	RequestMode        string

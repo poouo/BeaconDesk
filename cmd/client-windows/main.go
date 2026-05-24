@@ -24,6 +24,7 @@ func main() {
 	webSocketPath := flag.String("ws-path", "/ws", "relay WebSocket path")
 	tlsServerName := flag.String("tls-server-name", "", "TLS server name override")
 	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "skip TLS certificate verification for local self-signed testing")
+	tlsCertSHA256 := flag.String("tls-cert-sha256", "", "pin relay TLS leaf certificate SHA256 fingerprint")
 	name := flag.String("name", "beacondesk-windows", "device name")
 	role := flag.String("role", "peer", "device role: controller, controlled, peer")
 	requestMode := flag.String("request-mode", "view-control", "requested session mode: view or view-control")
@@ -49,7 +50,7 @@ func main() {
 		return
 	}
 	if *headless {
-		runHeadless(*server, *transportName, *useTLS, *webSocketPath, *tlsServerName, *tlsSkipVerify, *name, *role, *requestMode, *target, *targetCode, *publishCode, *token, *autoAccept, *enableInput, *mockFrames, *screenFrames, *captureFPS, *captureMaxWidth, *captureMaxHeight, *captureQuality, *bandwidthLimit, *staticFrameSeconds)
+		runHeadless(*server, *transportName, *useTLS, *webSocketPath, *tlsServerName, *tlsSkipVerify, *tlsCertSHA256, *name, *role, *requestMode, *target, *targetCode, *publishCode, *token, *autoAccept, *enableInput, *mockFrames, *screenFrames, *captureFPS, *captureMaxWidth, *captureMaxHeight, *captureQuality, *bandwidthLimit, *staticFrameSeconds)
 		return
 	}
 
@@ -59,7 +60,7 @@ func main() {
 	}
 }
 
-func runHeadless(server string, transportName string, useTLS bool, webSocketPath string, tlsServerName string, tlsSkipVerify bool, name string, role string, requestMode string, target string, targetCode string, publishCode bool, token string, autoAccept bool, enableInput bool, mockFrames bool, screenFrames bool, captureFPS int, captureMaxWidth int, captureMaxHeight int, captureQuality int, bandwidthLimit int, staticFrameSeconds int) {
+func runHeadless(server string, transportName string, useTLS bool, webSocketPath string, tlsServerName string, tlsSkipVerify bool, tlsCertSHA256 string, name string, role string, requestMode string, target string, targetCode string, publishCode bool, token string, autoAccept bool, enableInput bool, mockFrames bool, screenFrames bool, captureFPS int, captureMaxWidth int, captureMaxHeight int, captureQuality int, bandwidthLimit int, staticFrameSeconds int) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -71,6 +72,7 @@ func runHeadless(server string, transportName string, useTLS bool, webSocketPath
 		WebSocketPath:      webSocketPath,
 		TLSServerName:      tlsServerName,
 		TLSSkipVerify:      tlsSkipVerify,
+		TLSCertSHA256:      tlsCertSHA256,
 		DeviceName:         name,
 		Role:               role,
 		RequestMode:        requestMode,

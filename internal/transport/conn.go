@@ -2,12 +2,16 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +37,7 @@ type DialOptions struct {
 	WebSocketPath         string
 	TLSServerName         string
 	TLSInsecureSkipVerify bool
+	TLSCertSHA256         string
 }
 
 type TCPConn struct {
@@ -65,13 +70,13 @@ func Dial(ctx context.Context, opts DialOptions) (Conn, error) {
 func dialTCP(ctx context.Context, opts DialOptions) (*TCPConn, error) {
 	var dialer net.Dialer
 	if opts.EnableTLS {
+		tlsConfig, err := clientTLSConfig(opts)
+		if err != nil {
+			return nil, err
+		}
 		tlsDialer := tls.Dialer{
 			NetDialer: &dialer,
-			Config: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
-				ServerName:         opts.TLSServerName,
-				InsecureSkipVerify: opts.TLSInsecureSkipVerify, //nolint:gosec // Explicit local/self-signed testing option.
-			},
+			Config:    tlsConfig,
 		}
 		conn, err := tlsDialer.DialContext(ctx, "tcp", opts.Address)
 		if err != nil {
@@ -155,13 +160,13 @@ func DialWebSocket(ctx context.Context, opts DialOptions) (*WebSocketConn, error
 		scheme = "wss"
 	}
 	url := fmt.Sprintf("%s://%s%s", scheme, opts.Address, path)
+	tlsConfig, err := clientTLSConfig(opts)
+	if err != nil {
+		return nil, err
+	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			ServerName:         opts.TLSServerName,
-			InsecureSkipVerify: opts.TLSInsecureSkipVerify, //nolint:gosec // Explicit local/self-signed testing option.
-		},
+		TLSClientConfig:  tlsConfig,
 	}
 	conn, _, err := dialer.DialContext(ctx, url, http.Header{})
 	if err != nil {
@@ -169,6 +174,67 @@ func DialWebSocket(ctx context.Context, opts DialOptions) (*WebSocketConn, error
 	}
 	conn.SetReadLimit(protocol.MaxLineBytes)
 	return NewWebSocketConn(conn), nil
+}
+
+func clientTLSConfig(opts DialOptions) (*tls.Config, error) {
+	pin, hasPin, err := normalizeCertSHA256(opts.TLSCertSHA256)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: opts.TLSServerName,
+		// This option is exposed only for explicit local/self-signed testing.
+		InsecureSkipVerify: opts.TLSInsecureSkipVerify, //nolint:gosec
+	}
+	if hasPin {
+		cfg.InsecureSkipVerify = true //nolint:gosec // The pinned SHA256 fingerprint is verified below.
+		cfg.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("tls peer did not provide a certificate")
+			}
+			sum := sha256.Sum256(state.PeerCertificates[0].Raw)
+			if subtle.ConstantTimeCompare(sum[:], pin) != 1 {
+				return fmt.Errorf("tls certificate fingerprint mismatch: got %s", strings.ToUpper(hex.EncodeToString(sum[:])))
+			}
+			now := time.Now()
+			leaf := state.PeerCertificates[0]
+			if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+				return fmt.Errorf("tls certificate is outside its validity period")
+			}
+			return nil
+		}
+	}
+	return cfg, nil
+}
+
+func normalizeCertSHA256(value string) ([]byte, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false, nil
+	}
+	value = strings.TrimPrefix(value, "SHA256 Fingerprint=")
+	value = strings.TrimPrefix(value, "sha256 Fingerprint=")
+	value = strings.TrimPrefix(value, "sha256=")
+	value = strings.TrimPrefix(value, "SHA256=")
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case ':', '-', ' ', '\t', '\r', '\n':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	hexValue := b.String()
+	if len(hexValue) != sha256.Size*2 {
+		return nil, false, fmt.Errorf("tls certificate SHA256 fingerprint must be 64 hex characters")
+	}
+	pin, err := hex.DecodeString(hexValue)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid tls certificate SHA256 fingerprint: %w", err)
+	}
+	return pin, true, nil
 }
 
 func NewWebSocketConn(conn *websocket.Conn) *WebSocketConn {

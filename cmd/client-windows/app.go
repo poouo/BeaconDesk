@@ -15,9 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
@@ -53,6 +55,7 @@ type uiSettings struct {
 	WebSocketPath      string
 	TLSServerName      string
 	TLSSkipVerify      bool
+	TLSCertSHA256      string
 	DeviceName         string
 	Role               string
 	RequestMode        string
@@ -96,17 +99,22 @@ type nativeApp struct {
 	ops    op.Ops
 	theme  *material.Theme
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	logger *slog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
+	logger  *slog.Logger
+	logFile *os.File
+
+	english atomic.Bool
 
 	mu             sync.Mutex
+	renderMu       sync.Mutex
 	client         *coreclient.Client
 	settings       uiSettings
 	state          coreclient.State
 	events         []string
 	statusMessage  string
 	statusIsError  bool
+	requesting     bool
 	updateChecking bool
 	updateMessage  string
 	updateURL      string
@@ -114,6 +122,7 @@ type nativeApp struct {
 	lastFrameData  string
 	lastFrameImage paint.ImageOp
 	lastFrameSize  image.Point
+	lastFrameError string
 
 	targetEdit     widget.Editor
 	targetCodeEdit widget.Editor
@@ -128,10 +137,12 @@ type nativeApp struct {
 	rejectButton   widget.Clickable
 	eventsList     widget.List
 
-	showSettings  bool
-	settingsPage  int
-	settingsDraft uiSettings
-	settingsUI    settingsWidgets
+	showSettings   bool
+	settingsPage   int
+	settingsSaving bool
+	webShareBusy   bool
+	settingsDraft  uiSettings
+	settingsUI     settingsWidgets
 
 	remote *remoteWindow
 }
@@ -164,6 +175,7 @@ type settingsWidgets struct {
 	serverEdit  widget.Editor
 	wsPathEdit  widget.Editor
 	tlsNameEdit widget.Editor
+	tlsPinEdit  widget.Editor
 	nameEdit    widget.Editor
 	tokenEdit   widget.Editor
 	webTTLEdit  widget.Editor
@@ -235,34 +247,29 @@ var palette = appColors{
 func runNativeClient() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := newNativeApp(ctx, cancel)
-	go func() {
+	a.safeGo("main-window", func() {
 		if err := a.run(); err != nil {
 			a.logger.Error("native app failed", "error", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
-	}()
+	})
 	app.Main()
 	return nil
 }
 
 func newNativeApp(ctx context.Context, cancel context.CancelFunc) *nativeApp {
-	th := material.NewTheme()
-	th.Palette.Bg = palette.bg
-	th.Palette.Fg = palette.text
-	th.Palette.ContrastBg = palette.primary
-	th.Palette.ContrastFg = rgb(0xffffff)
-	th.TextSize = 15
-	th.Face = font.Typeface("Segoe UI, Microsoft YaHei UI, Microsoft YaHei, Noto Sans CJK SC, sans-serif")
-	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
-
+	logger, logFile := newClientLogger()
 	a := &nativeApp{
 		ctx:      ctx,
 		cancel:   cancel,
 		settings: loadUISettings(),
-		theme:    th,
-		logger:   slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		theme:    newAppTheme(),
+		logger:   logger,
+		logFile:  logFile,
 	}
+	a.logger.Info("BeaconDesk client starting", "version", version.Version, "config", appConfigPath(), "log", appLogPath())
+	a.english.Store(a.settings.Language == "en")
 	a.settings.AutoStart = isAutoStartEnabled()
 	a.updateMessage = a.tr("点击检查更新会连接 GitHub Releases。", "Click check for updates to query GitHub Releases.")
 	a.targetEdit.SingleLine = true
@@ -275,9 +282,21 @@ func newNativeApp(ctx context.Context, cancel context.CancelFunc) *nativeApp {
 	return a
 }
 
+func newAppTheme() *material.Theme {
+	th := material.NewTheme()
+	th.Palette.Bg = palette.bg
+	th.Palette.Fg = palette.text
+	th.Palette.ContrastBg = palette.primary
+	th.Palette.ContrastFg = rgb(0xffffff)
+	th.TextSize = 15
+	th.Face = font.Typeface("Segoe UI, Microsoft YaHei UI, Microsoft YaHei, Noto Sans CJK SC, sans-serif")
+	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
+	return th
+}
+
 func (a *nativeApp) initSettingsEditors() {
 	editors := []*widget.Editor{
-		&a.settingsUI.serverEdit, &a.settingsUI.wsPathEdit, &a.settingsUI.tlsNameEdit,
+		&a.settingsUI.serverEdit, &a.settingsUI.wsPathEdit, &a.settingsUI.tlsNameEdit, &a.settingsUI.tlsPinEdit,
 		&a.settingsUI.nameEdit, &a.settingsUI.tokenEdit, &a.settingsUI.webTTLEdit,
 	}
 	for _, ed := range editors {
@@ -291,6 +310,11 @@ func (a *nativeApp) initSettingsEditors() {
 }
 
 func (a *nativeApp) run() error {
+	defer func() {
+		if r := recover(); r != nil {
+			a.logger.Error("native app panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 	w := new(app.Window)
 	w.Option(
 		app.Title("BeaconDesk"),
@@ -300,7 +324,7 @@ func (a *nativeApp) run() error {
 	a.window = w
 
 	ticker := time.NewTicker(time.Second)
-	go func() {
+	a.safeGo("main-window-ticker", func() {
 		for {
 			select {
 			case <-a.ctx.Done():
@@ -309,7 +333,7 @@ func (a *nativeApp) run() error {
 				w.Invalidate()
 			}
 		}
-	}()
+	})
 
 	for {
 		switch e := w.Event().(type) {
@@ -318,9 +342,15 @@ func (a *nativeApp) run() error {
 			a.shutdown()
 			return e.Err
 		case app.FrameEvent:
-			gtx := app.NewContext(&a.ops, e)
-			a.layout(gtx)
-			e.Frame(gtx.Ops)
+			func() {
+				defer a.recoverFrame("main-frame")
+				a.renderMu.Lock()
+				defer a.renderMu.Unlock()
+				a.ops.Reset()
+				gtx := app.NewContext(&a.ops, e)
+				a.layout(gtx)
+				e.Frame(gtx.Ops)
+			}()
 		}
 	}
 }
@@ -413,6 +443,8 @@ func (a *nativeApp) layoutHeader(gtx layout.Context) layout.Dimensions {
 
 func (a *nativeApp) layoutDevicePanel(gtx layout.Context) layout.Dimensions {
 	state := a.currentState()
+	settings := a.settingsSnapshot()
+	connected := a.hasClient()
 	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(18).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(14)}.Layout(gtx,
@@ -435,7 +467,7 @@ func (a *nativeApp) layoutDevicePanel(gtx layout.Context) layout.Dimensions {
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Axis: layout.Horizontal, Gap: gtx.Dp(8)}.Layout(gtx,
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return a.button(gtx, &a.connectButton, a.tr("连接服务器", "Connect server"), buttonPrimary, a.currentClient() == nil)
+							return a.button(gtx, &a.connectButton, a.tr("连接服务器", "Connect server"), buttonPrimary, !connected)
 						}),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 							return a.button(gtx, &a.codeButton, a.tr("生成验证码", "New code"), buttonAccent, state.Registered)
@@ -443,10 +475,10 @@ func (a *nativeApp) layoutDevicePanel(gtx layout.Context) layout.Dimensions {
 					)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return a.button(gtx, &a.disconnectBtn, a.tr("断开连接", "Disconnect"), buttonDanger, a.currentClient() != nil)
+					return a.button(gtx, &a.disconnectBtn, a.tr("断开连接", "Disconnect"), buttonDanger, connected)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return a.label(gtx, fmt.Sprintf("%s / %s", roleLabel(a.settings.Role, a.settings.Language), mediaSummary(a.settings)), 12, palette.muted, font.Normal)
+					return a.label(gtx, fmt.Sprintf("%s / %s", roleLabel(settings.Role, settings.Language), mediaSummary(settings)), 12, palette.muted, font.Normal)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					msg, isErr := a.notice()
@@ -471,6 +503,12 @@ func (a *nativeApp) layoutWorkspace(gtx layout.Context) layout.Dimensions {
 }
 
 func (a *nativeApp) layoutAssistPanel(gtx layout.Context) layout.Dimensions {
+	state := a.currentState()
+	requesting := a.isRequesting()
+	requestLabel := a.tr("请求协助", "Request")
+	if requesting {
+		requestLabel = a.tr("请求中...", "Requesting...")
+	}
 	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(12)}.Layout(gtx,
@@ -486,7 +524,7 @@ func (a *nativeApp) layoutAssistPanel(gtx layout.Context) layout.Dimensions {
 							return a.inputField(gtx, &a.targetCodeEdit, a.tr("验证码", "Code"))
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return a.button(gtx, &a.requestButton, a.tr("请求协助", "Request"), buttonPrimary, a.currentClient() != nil)
+							return a.button(gtx, &a.requestButton, requestLabel, buttonPrimary, state.Registered && !requesting)
 						}),
 					)
 				}),
@@ -497,13 +535,14 @@ func (a *nativeApp) layoutAssistPanel(gtx layout.Context) layout.Dimensions {
 
 func (a *nativeApp) layoutApprovalPanel(gtx layout.Context) layout.Dimensions {
 	state := a.currentState()
+	settings := a.settingsSnapshot()
 	if state.PendingPeerID == "" {
 		return layout.Dimensions{}
 	}
 	return roundedPanel(gtx, color.NRGBA{R: 255, G: 251, B: 235, A: 255}, 8, func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(14).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			peer := peerNameFromPending(state)
-			detail := fmt.Sprintf("%s · %s", peer, modeLabel(state.PendingMode, a.settings.Language))
+			detail := fmt.Sprintf("%s · %s", peer, modeLabel(state.PendingMode, settings.Language))
 			if state.PendingInput {
 				detail += " · " + a.tr("请求鼠标键盘控制", "Requests mouse and keyboard control")
 			}
@@ -534,6 +573,7 @@ func (a *nativeApp) layoutApprovalPanel(gtx layout.Context) layout.Dimensions {
 
 func (a *nativeApp) layoutSessionPanel(gtx layout.Context) layout.Dimensions {
 	state := a.currentState()
+	settings := a.settingsSnapshot()
 	return roundedPanel(gtx, palette.card, 8, func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(16).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(14)}.Layout(gtx,
@@ -570,10 +610,10 @@ func (a *nativeApp) layoutSessionPanel(gtx layout.Context) layout.Dimensions {
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Axis: layout.Horizontal, Gap: gtx.Dp(10)}.Layout(gtx,
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return metricTile(gtx, a.theme, a.tr("模式", "Mode"), modeLabel(state.SessionMode, a.settings.Language))
+							return metricTile(gtx, a.theme, a.tr("模式", "Mode"), modeLabel(state.SessionMode, settings.Language))
 						}),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return metricTile(gtx, a.theme, a.tr("输入权限", "Input"), stateInputText(state, a.settings.Language))
+							return metricTile(gtx, a.theme, a.tr("输入权限", "Input"), stateInputText(state, settings.Language))
 						}),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 							return metricTile(gtx, a.theme, a.tr("画质 / FPS", "Quality / FPS"), formatQuality(state))
@@ -652,7 +692,7 @@ func (a *nativeApp) connect() {
 	a.mu.Unlock()
 	a.invalidate()
 
-	go func() {
+	a.safeGo("connect", func() {
 		c := coreclient.New(coreclient.Options{
 			ServerAddress:      opts.ServerAddress,
 			Transport:          opts.Transport,
@@ -660,6 +700,7 @@ func (a *nativeApp) connect() {
 			WebSocketPath:      opts.WebSocketPath,
 			TLSServerName:      opts.TLSServerName,
 			TLSSkipVerify:      opts.TLSSkipVerify,
+			TLSCertSHA256:      opts.TLSCertSHA256,
 			DeviceName:         opts.DeviceName,
 			Role:               opts.Role,
 			RequestMode:        opts.RequestMode,
@@ -696,8 +737,8 @@ func (a *nativeApp) connect() {
 		a.mu.Unlock()
 		a.invalidate()
 
-		go a.forwardEvents(c)
-	}()
+		a.safeGo("client-events", func() { a.forwardEvents(c) })
+	})
 }
 
 func (a *nativeApp) disconnect() {
@@ -708,6 +749,7 @@ func (a *nativeApp) disconnect() {
 	a.lastFrameData = ""
 	a.lastFrameImage = paint.ImageOp{}
 	a.lastFrameSize = image.Point{}
+	a.lastFrameError = ""
 	a.setNoticeLocked(a.tr("已断开连接。", "Disconnected."), false)
 	a.mu.Unlock()
 	if c != nil {
@@ -723,14 +765,38 @@ func (a *nativeApp) requestSession() {
 		a.invalidate()
 		return
 	}
+	state := c.State()
+	if !state.Registered {
+		a.setNotice(a.tr("设备还未完成注册，请等待顶部显示“已注册”后再请求。", "Device is not registered yet. Wait until the header shows Registered."), true)
+		a.invalidate()
+		return
+	}
+	a.mu.Lock()
+	if a.requesting {
+		a.mu.Unlock()
+		return
+	}
+	a.requesting = true
+	a.mu.Unlock()
+	a.invalidate()
+
 	target := strings.TrimSpace(a.targetEdit.Text())
 	if target == "" {
+		a.mu.Lock()
+		a.requesting = false
+		a.mu.Unlock()
 		a.setNotice(a.tr("请输入目标设备 ID。", "Enter a target device ID."), true)
 		a.invalidate()
 		return
 	}
 	code := strings.TrimSpace(a.targetCodeEdit.Text())
-	go func() {
+	a.safeGo("request-session", func() {
+		defer func() {
+			a.mu.Lock()
+			a.requesting = false
+			a.mu.Unlock()
+			a.invalidate()
+		}()
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		if err := c.RequestSessionWithCode(ctx, target, code); err != nil {
@@ -739,7 +805,7 @@ func (a *nativeApp) requestSession() {
 			a.setNotice(a.tr("已发送协助请求，等待对方授权。", "Request sent. Waiting for peer approval."), false)
 		}
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) generateCode() {
@@ -749,7 +815,7 @@ func (a *nativeApp) generateCode() {
 		a.invalidate()
 		return
 	}
-	go func() {
+	a.safeGo("generate-code", func() {
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		code, err := c.GenerateTemporaryCode(ctx, 10*time.Minute)
@@ -760,7 +826,7 @@ func (a *nativeApp) generateCode() {
 		}
 		a.applyState(c.State())
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) approveSession(remember bool) {
@@ -768,7 +834,7 @@ func (a *nativeApp) approveSession(remember bool) {
 	if c == nil {
 		return
 	}
-	go func() {
+	a.safeGo("approve-session", func() {
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		var err error
@@ -784,7 +850,7 @@ func (a *nativeApp) approveSession(remember bool) {
 		}
 		a.applyState(c.State())
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) rejectSession() {
@@ -792,7 +858,7 @@ func (a *nativeApp) rejectSession() {
 	if c == nil {
 		return
 	}
-	go func() {
+	a.safeGo("reject-session", func() {
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		if err := c.RejectSession(ctx, "rejected by user"); err != nil {
@@ -802,7 +868,7 @@ func (a *nativeApp) rejectSession() {
 		}
 		a.applyState(c.State())
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) forwardEvents(c *coreclient.Client) {
@@ -815,9 +881,39 @@ func (a *nativeApp) forwardEvents(c *coreclient.Client) {
 				return
 			}
 			a.appendEvent(event)
+			a.handleClientEvent(event)
 			a.applyState(c.State())
 			a.invalidate()
 		}
+	}
+}
+
+func (a *nativeApp) handleClientEvent(evt coreclient.Event) {
+	switch evt.Type {
+	case "device.registered":
+		a.setNotice(a.tr("设备已注册，可以发起或接收远程协助。", "Device registered. You can request or receive assistance."), false)
+	case "relay.error":
+		a.setNotice(humanRelayError(evt.Message, a.english.Load()), true)
+	case "screen.disabled":
+		a.setNotice(a.tr("被控端未开启屏幕画面发送，控制端会一直等待画面。", "Screen sending is disabled on the controlled device, so the controller will keep waiting."), true)
+	case "screen.error":
+		a.setNotice(humanScreenError(evt.Message, a.english.Load()), true)
+	case "stream.error":
+		a.setNotice(humanScreenError(evt.Message, a.english.Load()), true)
+	case "stream.status":
+		a.setNotice(evt.Message, false)
+	case "session.incoming":
+		a.setNotice(a.tr("收到远程协助请求，请在本机确认。", "Incoming assistance request. Please approve locally."), false)
+	case "session.ready":
+		a.setNotice(a.tr("远程协助会话已建立。", "Remote assistance session is ready."), false)
+		if c := a.currentClient(); c != nil {
+			state := c.State()
+			if state.SessionID != "" && state.SessionLocalRole != protocol.RoleControlled && !state.ShouldSendView {
+				a.openRemoteWindow()
+			}
+		}
+	case "session.declined":
+		a.setNotice(a.tr("对方已拒绝本次远程协助。", "The peer declined this assistance request."), true)
 	}
 }
 
@@ -848,11 +944,22 @@ func (a *nativeApp) decodeLatestFrameLocked(state coreclient.State) {
 	if state.LastFrameData == "" || state.LastFrameData == a.lastFrameData {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			a.state.LastFrameError = fmt.Sprintf("画面解码异常：%v", r)
+			a.lastFrameData = state.LastFrameData
+			a.lastFrameError = a.state.LastFrameError
+		}
+	}()
 	img, err := decodeFrameImage(state.LastFrameData)
 	if err != nil {
+		a.state.LastFrameError = "画面解码失败：" + err.Error()
+		a.lastFrameData = state.LastFrameData
+		a.lastFrameError = a.state.LastFrameError
 		return
 	}
 	a.lastFrameData = state.LastFrameData
+	a.lastFrameError = ""
 	a.lastFrameImage = paint.NewImageOp(img)
 	a.lastFrameSize = image.Pt(state.LastFrameWidth, state.LastFrameHeight)
 	if a.lastFrameSize.X <= 0 || a.lastFrameSize.Y <= 0 {
@@ -867,6 +974,18 @@ func (a *nativeApp) currentClient() *coreclient.Client {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.client
+}
+
+func (a *nativeApp) hasClient() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.client != nil
+}
+
+func (a *nativeApp) settingsSnapshot() uiSettings {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.settings
 }
 
 func (a *nativeApp) currentState() coreclient.State {
@@ -888,7 +1007,11 @@ func (a *nativeApp) currentState() coreclient.State {
 func (a *nativeApp) frameSnapshot() (paint.ImageOp, image.Point, coreclient.State) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.lastFrameImage, a.lastFrameSize, a.state
+	state := a.state
+	if state.LastFrameError == "" && a.lastFrameError != "" {
+		state.LastFrameError = a.lastFrameError
+	}
+	return a.lastFrameImage, a.lastFrameSize, state
 }
 
 func (a *nativeApp) eventLines() []string {
@@ -920,6 +1043,37 @@ func (a *nativeApp) updateStatus() (string, string, bool, bool) {
 	return a.updateMessage, a.updateURL, a.updateChecking, a.updateIsError
 }
 
+func (a *nativeApp) settingsActionState() (saving bool, webBusy bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.settingsSaving, a.webShareBusy
+}
+
+func (a *nativeApp) isRequesting() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.requesting
+}
+
+func (a *nativeApp) safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logger.Error("goroutine panic", "name", name, "panic", r, "stack", string(debug.Stack()))
+				a.invalidate()
+			}
+		}()
+		fn()
+	}()
+}
+
+func (a *nativeApp) recoverFrame(name string) {
+	if r := recover(); r != nil {
+		a.logger.Error("frame panic", "name", name, "panic", r, "stack", string(debug.Stack()))
+		a.invalidate()
+	}
+}
+
 func (a *nativeApp) invalidate() {
 	if a.window != nil {
 		a.window.Invalidate()
@@ -930,13 +1084,20 @@ func (a *nativeApp) invalidate() {
 }
 
 func (a *nativeApp) shutdown() {
+	a.logger.Info("BeaconDesk client shutting down")
 	a.cancel()
 	a.mu.Lock()
 	c := a.client
 	a.client = nil
+	f := a.logFile
+	a.logFile = nil
 	a.mu.Unlock()
 	if c != nil {
 		c.Close()
+	}
+	if f != nil {
+		_ = f.Sync()
+		_ = f.Close()
 	}
 }
 
@@ -950,14 +1111,25 @@ func (a *nativeApp) openRemoteWindow() {
 	rw := &remoteWindow{
 		app:    a,
 		window: new(app.Window),
-		theme:  a.theme,
+		theme:  newAppTheme(),
 	}
 	a.remote = rw
 	a.mu.Unlock()
-	go rw.run()
+	a.safeGo("remote-window", rw.run)
 }
 
 func (rw *remoteWindow) run() {
+	defer func() {
+		if r := recover(); r != nil {
+			rw.app.logger.Error("remote window panic", "panic", r, "stack", string(debug.Stack()))
+			rw.app.mu.Lock()
+			if rw.app.remote == rw {
+				rw.app.remote = nil
+			}
+			rw.app.mu.Unlock()
+			rw.app.invalidate()
+		}
+	}()
 	title := rw.app.tr("BeaconDesk 远程画面", "BeaconDesk Remote Screen")
 	rw.window.Option(app.Title(title), app.Size(unit.Dp(1024), unit.Dp(680)), app.MinSize(unit.Dp(720), unit.Dp(480)))
 	for {
@@ -970,9 +1142,15 @@ func (rw *remoteWindow) run() {
 			rw.app.mu.Unlock()
 			return
 		case app.FrameEvent:
-			gtx := app.NewContext(&rw.ops, e)
-			rw.layout(gtx)
-			e.Frame(gtx.Ops)
+			func() {
+				defer rw.app.recoverFrame("remote-frame")
+				rw.app.renderMu.Lock()
+				defer rw.app.renderMu.Unlock()
+				rw.ops.Reset()
+				gtx := app.NewContext(&rw.ops, e)
+				rw.layout(gtx)
+				e.Frame(gtx.Ops)
+			}()
 		}
 	}
 }
@@ -1004,15 +1182,15 @@ func (rw *remoteWindow) toolbar(gtx layout.Context) layout.Dimensions {
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(2)}.Layout(gtx,
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return rw.app.label(gtx, title, 17, rgb(0xffffff), font.SemiBold)
+						return labelWithTheme(gtx, rw.theme, title, 17, rgb(0xffffff), font.SemiBold)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return rw.app.label(gtx, subtitle, 12, rgb(0xa7b0c0), font.Normal)
+						return labelWithTheme(gtx, rw.theme, subtitle, 12, rgb(0xa7b0c0), font.Normal)
 					}),
 				)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return rw.app.button(gtx, &rw.closeBtn, rw.app.tr("关闭", "Close"), buttonDark, true)
+				return buttonWithTheme(gtx, rw.theme, &rw.closeBtn, rw.app.tr("关闭", "Close"), buttonDark, true)
 			}),
 		)
 	})
@@ -1035,6 +1213,8 @@ func (rw *remoteWindow) screen(gtx layout.Context) layout.Dimensions {
 	if size.X > 0 && size.Y > 0 {
 		screenRect = fitRect(area, size)
 	}
+	frameErr := strings.TrimSpace(state.LastFrameError)
+	frameStatus := strings.TrimSpace(state.LastFrameStatus)
 
 	defer clip.Rect(area).Push(gtx.Ops).Pop()
 	if img.Size().X > 0 {
@@ -1054,10 +1234,21 @@ func (rw *remoteWindow) screen(gtx layout.Context) layout.Dimensions {
 		gtx2.Constraints = layout.Exact(screenRect.Size())
 		layout.Center.Layout(gtx2, func(gtx layout.Context) layout.Dimensions {
 			msg := rw.app.tr("等待远程画面...", "Waiting for remote video...")
+			col := rgb(0xa7b0c0)
 			if state.SessionID == "" {
 				msg = rw.app.tr("暂无活动会话", "No active session")
+			} else if frameErr != "" {
+				msg = frameErr + "\n" + rw.app.tr("请确认被控端未锁屏、当前用户桌面可见，并已开启“发送屏幕画面”。", "Make sure the controlled desktop is unlocked, visible, and screen sending is enabled.")
+				col = rgb(0xfca5a5)
+			} else if frameStatus != "" {
+				msg = frameStatus
+				col = rgb(0xfcd34d)
+			} else if state.SessionLocalRole == protocol.RoleControlled {
+				msg = rw.app.tr("本机是被控端，正在把画面发送给对方。", "This device is controlled and is sending its screen.")
+			} else if state.FramesReceived == 0 {
+				msg = rw.app.tr("等待被控端发送第一帧画面。请在被控端设置 -> 授权中开启“发送屏幕画面”。", "Waiting for the controlled device to send the first frame. Enable screen sending on the controlled device.")
 			}
-			return rw.app.label(gtx, msg, 15, rgb(0xa7b0c0), font.Normal)
+			return labelWithTheme(gtx, rw.theme, msg, 15, col, font.Normal)
 		})
 	}
 
@@ -1066,6 +1257,9 @@ func (rw *remoteWindow) screen(gtx layout.Context) layout.Dimensions {
 }
 
 func (rw *remoteWindow) handleRemoteInput(gtx layout.Context, rect image.Rectangle, source image.Point, state coreclient.State) {
+	defer clip.Rect(rect).Push(gtx.Ops).Pop()
+	event.Op(gtx.Ops, &rw.pointerTag)
+	event.Op(gtx.Ops, &rw.keyTag)
 	if source.X <= 0 {
 		source.X = max(1, rect.Dx())
 	}
@@ -1135,10 +1329,7 @@ func (rw *remoteWindow) handleRemoteInput(gtx layout.Context, rect image.Rectang
 			Modifiers: gioModifiers(ke.Modifiers),
 		})
 	}
-	defer clip.Rect(rect).Push(gtx.Ops).Pop()
 	pointer.CursorCrosshair.Add(gtx.Ops)
-	event.Op(gtx.Ops, &rw.pointerTag)
-	event.Op(gtx.Ops, &rw.keyTag)
 }
 
 func (rw *remoteWindow) sendMouse(event input.MouseEvent) {
@@ -1146,14 +1337,14 @@ func (rw *remoteWindow) sendMouse(event input.MouseEvent) {
 	if c == nil {
 		return
 	}
-	go func() {
+	rw.app.safeGo("send-mouse", func() {
 		ctx, cancel := context.WithTimeout(rw.app.ctx, 2*time.Second)
 		defer cancel()
 		if err := c.SendMouse(ctx, event); err != nil {
 			rw.app.setNotice(fmt.Sprintf("%s: %v", rw.app.tr("鼠标事件发送失败", "Mouse event failed"), err), true)
 			rw.app.invalidate()
 		}
-	}()
+	})
 }
 
 func (rw *remoteWindow) sendKeyboard(event input.KeyboardEvent) {
@@ -1161,14 +1352,14 @@ func (rw *remoteWindow) sendKeyboard(event input.KeyboardEvent) {
 	if c == nil {
 		return
 	}
-	go func() {
+	rw.app.safeGo("send-keyboard", func() {
 		ctx, cancel := context.WithTimeout(rw.app.ctx, 2*time.Second)
 		defer cancel()
 		if err := c.SendKeyboard(ctx, event); err != nil {
 			rw.app.setNotice(fmt.Sprintf("%s: %v", rw.app.tr("键盘事件发送失败", "Keyboard event failed"), err), true)
 			rw.app.invalidate()
 		}
-	}()
+	})
 }
 
 func (a *nativeApp) openSettings() {
@@ -1188,6 +1379,7 @@ func (a *nativeApp) openSettings() {
 	setEditorText(&a.settingsUI.serverEdit, a.settingsDraft.ServerAddress)
 	setEditorText(&a.settingsUI.wsPathEdit, a.settingsDraft.WebSocketPath)
 	setEditorText(&a.settingsUI.tlsNameEdit, a.settingsDraft.TLSServerName)
+	setEditorText(&a.settingsUI.tlsPinEdit, a.settingsDraft.TLSCertSHA256)
 	setEditorText(&a.settingsUI.nameEdit, a.settingsDraft.DeviceName)
 	setEditorText(&a.settingsUI.tokenEdit, a.settingsDraft.Token)
 	setEditorText(&a.settingsUI.webTTLEdit, strconv.Itoa(a.settingsDraft.WebShareTTLMinutes))
@@ -1206,43 +1398,59 @@ func (a *nativeApp) openSettings() {
 
 func (a *nativeApp) layoutSettingsOverlay(gtx layout.Context) layout.Dimensions {
 	a.handleSettingsClicks(gtx)
+	saving, _ := a.settingsActionState()
 	gtx.Constraints.Min = gtx.Constraints.Max
-	paint.Fill(gtx.Ops, color.NRGBA{R: 15, G: 23, B: 42, A: 120})
+	paint.Fill(gtx.Ops, color.NRGBA{R: 15, G: 23, B: 42, A: 110})
 	return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		maxW := min(gtx.Constraints.Max.X-gtx.Dp(40), gtx.Dp(920))
-		maxH := min(gtx.Constraints.Max.Y-gtx.Dp(40), gtx.Dp(620))
+		maxW := min(gtx.Constraints.Max.X-gtx.Dp(32), gtx.Dp(1040))
+		maxH := min(gtx.Constraints.Max.Y-gtx.Dp(32), gtx.Dp(680))
 		gtx.Constraints = layout.Exact(image.Pt(maxW, maxH))
-		return roundedPanel(gtx, palette.panel, 8, func(gtx layout.Context) layout.Dimensions {
+		return roundedPanel(gtx, rgb(0xf8fbff), 8, func(gtx layout.Context) layout.Dimensions {
+			drawStroke(gtx, gtx.Constraints.Min, rgb(0xe2e8f0), 8, 1)
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layout.Inset{Top: 16, Bottom: 12, Left: 18, Right: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Top: 18, Bottom: 14, Left: 20, Right: 20}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
 							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-								return sectionHeader(gtx, a.theme, a.tr("BeaconDesk 设置", "BeaconDesk Settings"), a.tr("配置连接服务器、授权策略、画面参数和审计信息。", "Configure server, authorization, video, network, and audit settings."))
-							}),
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return a.button(gtx, &a.settingsUI.cancelBtn, a.tr("关闭", "Close"), buttonSecondary, true)
+								return sectionHeader(gtx, a.theme, a.tr("设置", "Settings"), a.tr("连接、安全、显示、性能和网页控制配置。", "Connection, security, display, performance, and web control settings."))
 							}),
 						)
 					})
 				}),
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return withWidth(gtx, gtx.Dp(210), a.layoutSettingsNav)
-						}),
-						layout.Flexed(1, a.layoutSettingsPage),
-					)
+					return layout.Inset{Left: 14, Right: 14}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return roundedPanel(gtx, palette.panel, 8, func(gtx layout.Context) layout.Dimensions {
+							drawStroke(gtx, gtx.Constraints.Min, rgb(0xe5e7eb), 8, 1)
+							return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return withWidth(gtx, gtx.Dp(190), a.layoutSettingsNav)
+								}),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									size := image.Pt(gtx.Dp(1), gtx.Constraints.Max.Y)
+									paint.FillShape(gtx.Ops, rgb(0xe5e7eb), clip.Rect(image.Rectangle{Max: size}).Op())
+									return layout.Dimensions{Size: size}
+								}),
+								layout.Flexed(1, a.layoutSettingsPage),
+							)
+						})
+					})
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layout.Inset{Top: 12, Bottom: 16, Left: 18, Right: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(10), Spacing: layout.SpaceStart}.Layout(gtx,
+					return layout.Inset{Top: 14, Bottom: 18, Left: 20, Right: 20}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Gap: gtx.Dp(10)}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return a.button(gtx, &a.settingsUI.cancelBtn, a.tr("取消", "Cancel"), buttonSecondary, true)
+							}),
 							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 								note := fmt.Sprintf("%s %s", a.tr("配置保存在本地文件：", "Config file:"), appConfigPath())
 								return a.label(gtx, note, 12, palette.muted, font.Normal)
 							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return a.button(gtx, &a.settingsUI.saveButton, a.tr("保存", "Save"), buttonPrimary, true)
+								label := a.tr("保存", "Save")
+								if saving {
+									label = a.tr("保存中...", "Saving...")
+								}
+								return a.button(gtx, &a.settingsUI.saveButton, label, buttonPrimary, !saving)
 							}),
 						)
 					})
@@ -1254,10 +1462,10 @@ func (a *nativeApp) layoutSettingsOverlay(gtx layout.Context) layout.Dimensions 
 
 func (a *nativeApp) layoutSettingsNav(gtx layout.Context) layout.Dimensions {
 	items := settingsNavItems(a.draftLanguage())
-	return layout.Inset{Top: 8, Bottom: 8, Left: 10, Right: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(8)}.Layout(gtx,
+	return layout.Inset{Top: 22, Bottom: 18, Left: 10, Right: 10}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(10)}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return a.label(gtx, a.tr("设置", "Settings"), 14, palette.muted, font.SemiBold)
+				return a.label(gtx, a.tr("设置分类", "Settings"), 13, palette.muted, font.SemiBold)
 			}),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				children := make([]layout.FlexChild, 0, len(items))
@@ -1275,7 +1483,7 @@ func (a *nativeApp) layoutSettingsNav(gtx layout.Context) layout.Dimensions {
 }
 
 func (a *nativeApp) layoutSettingsPage(gtx layout.Context) layout.Dimensions {
-	return layout.Inset{Top: 8, Bottom: 8, Left: 18, Right: 18}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+	return layout.Inset{Top: 26, Bottom: 20, Left: 24, Right: 24}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		switch a.settingsPage {
 		case 1:
 			return a.layoutRelaySettings(gtx)
@@ -1384,6 +1592,9 @@ func (a *nativeApp) layoutRelaySettings(gtx layout.Context) layout.Dimensions {
 			return a.formRow(gtx, a.tr("TLS 服务名", "TLS server name"), &a.settingsUI.tlsNameEdit, "relay.example.com")
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return a.formRow(gtx, a.tr("TLS 证书指纹", "TLS cert SHA256"), &a.settingsUI.tlsPinEdit, a.tr("自签证书可填 SHA256 指纹", "SHA256 fingerprint for self-signed certs"))
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return a.switchRow(gtx, a.tr("使用 TLS", "Use TLS"), &a.settingsUI.tlsCheck)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -1411,6 +1622,9 @@ func (a *nativeApp) layoutAuthSettings(gtx layout.Context) layout.Dimensions {
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return a.switchRow(gtx, a.tr("发送屏幕画面", "Send screen frames"), &a.settingsUI.screenFramesCheck)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return noticeBox(gtx, a.theme, a.tr("被控端需要开启“发送屏幕画面”才会把远程画面传给控制端；锁屏、UAC 安全桌面或服务会话可能无法采集。", "The controlled device must enable screen frame sending. Lock screens, UAC secure desktop, or service sessions may block capture."), palette.warning)
 		}),
 	)
 }
@@ -1441,6 +1655,16 @@ func (a *nativeApp) layoutMediaSettings(gtx layout.Context) layout.Dimensions {
 func (a *nativeApp) layoutWebControlSettings(gtx layout.Context) layout.Dimensions {
 	shares := append([]protocol.WebSharePayload(nil), a.settingsUI.webShareRows...)
 	selectedOK := a.settingsUI.selectedWebShare >= 0 && a.settingsUI.selectedWebShare < len(shares)
+	_, webBusy := a.settingsActionState()
+	connected := a.hasClient()
+	createLabel := a.tr("生成链接", "Generate")
+	refreshLabel := a.tr("刷新", "Refresh")
+	revokeLabel := a.tr("删除/撤销", "Delete/Revoke")
+	if webBusy {
+		createLabel = a.tr("处理中...", "Working...")
+		refreshLabel = a.tr("处理中...", "Working...")
+		revokeLabel = a.tr("处理中...", "Working...")
+	}
 	return layout.Flex{Axis: layout.Vertical, Gap: gtx.Dp(12)}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return pageTitle(gtx, a.theme, settingsNavItems(a.draftLanguage())[4])
@@ -1454,14 +1678,14 @@ func (a *nativeApp) layoutWebControlSettings(gtx layout.Context) layout.Dimensio
 					return a.formRow(gtx, a.tr("有效期（分钟）", "Validity minutes"), &a.settingsUI.webTTLEdit, "60")
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return a.button(gtx, &a.settingsUI.webCreateBtn, a.tr("生成链接", "Generate"), buttonPrimary, a.currentClient() != nil)
+					return a.button(gtx, &a.settingsUI.webCreateBtn, createLabel, buttonPrimary, connected && !webBusy)
 				}),
 			)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Horizontal, Gap: gtx.Dp(8)}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return a.button(gtx, &a.settingsUI.webRefreshBtn, a.tr("刷新", "Refresh"), buttonSecondary, a.currentClient() != nil)
+					return a.button(gtx, &a.settingsUI.webRefreshBtn, refreshLabel, buttonSecondary, connected && !webBusy)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return a.button(gtx, &a.settingsUI.webCopyBtn, a.tr("复制选中链接", "Copy selected"), buttonSecondary, selectedOK)
@@ -1470,7 +1694,7 @@ func (a *nativeApp) layoutWebControlSettings(gtx layout.Context) layout.Dimensio
 					return a.button(gtx, &a.settingsUI.webOpenBtn, a.tr("打开选中链接", "Open selected"), buttonAccent, selectedOK)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return a.button(gtx, &a.settingsUI.webRevokeBtn, a.tr("删除/撤销", "Delete/Revoke"), buttonDanger, selectedOK && a.currentClient() != nil)
+					return a.button(gtx, &a.settingsUI.webRevokeBtn, revokeLabel, buttonDanger, selectedOK && connected && !webBusy)
 				}),
 			)
 		}),
@@ -1612,6 +1836,15 @@ func (a *nativeApp) handleSettingsClicks(gtx layout.Context) {
 }
 
 func (a *nativeApp) saveSettings() {
+	a.mu.Lock()
+	if a.settingsSaving {
+		a.mu.Unlock()
+		return
+	}
+	a.settingsSaving = true
+	a.mu.Unlock()
+	a.invalidate()
+
 	language := a.settingsUI.language.Value
 	if language == "" {
 		language = "zh-CN"
@@ -1625,6 +1858,7 @@ func (a *nativeApp) saveSettings() {
 		WebSocketPath:      textOr(a.settingsUI.wsPathEdit.Text(), "/ws"),
 		TLSServerName:      strings.TrimSpace(a.settingsUI.tlsNameEdit.Text()),
 		TLSSkipVerify:      a.settingsUI.skipTLSCheck.Value,
+		TLSCertSHA256:      strings.TrimSpace(a.settingsUI.tlsPinEdit.Text()),
 		DeviceName:         textOr(a.settingsUI.nameEdit.Text(), "beacondesk-windows"),
 		Role:               textOr(a.settingsUI.role.Value, "peer"),
 		RequestMode:        textOr(a.settingsUI.mode.Value, "view-control"),
@@ -1642,22 +1876,31 @@ func (a *nativeApp) saveSettings() {
 		BandwidthLimitKbps: parsePresetInt(a.settingsUI.bitratePreset.Value, 4096, []int{512, 1024, 2048, 4096, 8192, 12288, 20000, 50000}),
 		StaticFrameSeconds: parsePresetInt(a.settingsUI.staticPreset.Value, 5, []int{1, 3, 5, 10, 15, 30}),
 	}
-	if err := setAutoStart(next.AutoStart); err != nil {
-		a.setNotice(fmt.Sprintf("%s: %v", a.tr("自启动设置失败", "Auto-start update failed"), err), true)
+
+	a.safeGo("save-settings", func() {
+		var err error
+		var msg string
+		if err = setAutoStart(next.AutoStart); err != nil {
+			msg = fmt.Sprintf("%s: %v", a.tr("自启动设置失败", "Auto-start update failed"), err)
+		} else if err = saveUISettings(next); err != nil {
+			msg = fmt.Sprintf("%s: %v", a.tr("保存配置失败", "Failed to save settings"), err)
+		}
+
+		a.mu.Lock()
+		a.settingsSaving = false
+		if err != nil {
+			a.setNoticeLocked(msg, true)
+			a.mu.Unlock()
+			a.invalidate()
+			return
+		}
+		a.settings = next
+		a.english.Store(next.Language == "en")
+		a.showSettings = false
+		a.setNoticeLocked(a.tr("设置已保存到本地配置文件，新的连接会使用这些配置。", "Settings saved to local config. New connections will use these values."), false)
+		a.mu.Unlock()
 		a.invalidate()
-		return
-	}
-	if err := saveUISettings(next); err != nil {
-		a.setNotice(fmt.Sprintf("%s: %v", a.tr("保存配置失败", "Failed to save settings"), err), true)
-		a.invalidate()
-		return
-	}
-	a.mu.Lock()
-	a.settings = next
-	a.setNoticeLocked(a.tr("设置已保存到本地配置文件，新的连接会使用这些配置。", "Settings saved to local config. New connections will use these values."), false)
-	a.mu.Unlock()
-	a.showSettings = false
-	a.invalidate()
+	})
 }
 
 func (a *nativeApp) checkForUpdates() {
@@ -1673,7 +1916,7 @@ func (a *nativeApp) checkForUpdates() {
 	a.mu.Unlock()
 	a.invalidate()
 
-	go func() {
+	a.safeGo("check-updates", func() {
 		ctx, cancel := context.WithTimeout(a.ctx, 12*time.Second)
 		defer cancel()
 		result, err := updatecheck.Latest(ctx, updatecheck.Options{
@@ -1708,7 +1951,7 @@ func (a *nativeApp) checkForUpdates() {
 			a.updateMessage = fmt.Sprintf("%s %s%s", a.tr("当前已是最新版本：", "You are up to date:"), result.LatestVersion, published)
 		}
 		a.window.Invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) openReleasePage() {
@@ -1729,12 +1972,23 @@ func (a *nativeApp) createWebShare() {
 		a.invalidate()
 		return
 	}
-	ttlMinutes := parseInt(a.settingsUI.webTTLEdit.Text(), a.settings.WebShareTTLMinutes, 1, 10080)
+	a.mu.Lock()
+	if a.webShareBusy {
+		a.mu.Unlock()
+		return
+	}
+	a.webShareBusy = true
+	a.mu.Unlock()
+	a.invalidate()
+
+	settings := a.settingsSnapshot()
+	ttlMinutes := parseInt(a.settingsUI.webTTLEdit.Text(), settings.WebShareTTLMinutes, 1, 10080)
 	mode := a.settingsUI.mode.Value
 	if mode == "" {
-		mode = a.settings.RequestMode
+		mode = settings.RequestMode
 	}
-	go func() {
+	a.safeGo("create-web-share", func() {
+		defer a.finishWebShareAction()
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		if err := c.CreateWebShare(ctx, time.Duration(ttlMinutes)*time.Minute, mode, ""); err != nil {
@@ -1745,12 +1999,22 @@ func (a *nativeApp) createWebShare() {
 		a.applyState(c.State())
 		a.refreshWebSharesFromState(c.State())
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) refreshWebShares() {
 	if c := a.currentClient(); c != nil {
-		go func() {
+		a.mu.Lock()
+		if a.webShareBusy {
+			a.mu.Unlock()
+			return
+		}
+		a.webShareBusy = true
+		a.mu.Unlock()
+		a.invalidate()
+
+		a.safeGo("refresh-web-shares", func() {
+			defer a.finishWebShareAction()
 			ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 			defer cancel()
 			if err := c.RefreshWebShares(ctx); err != nil {
@@ -1759,13 +2023,20 @@ func (a *nativeApp) refreshWebShares() {
 			a.applyState(c.State())
 			a.refreshWebSharesFromState(c.State())
 			a.invalidate()
-		}()
+		})
 		return
 	}
 	a.mu.Lock()
 	a.settingsUI.webShareRows = nil
 	a.settingsUI.selectedWebShare = -1
 	a.mu.Unlock()
+}
+
+func (a *nativeApp) finishWebShareAction() {
+	a.mu.Lock()
+	a.webShareBusy = false
+	a.mu.Unlock()
+	a.invalidate()
 }
 
 func (a *nativeApp) refreshWebSharesFromState(state coreclient.State) {
@@ -1798,7 +2069,17 @@ func (a *nativeApp) revokeSelectedWebShare() {
 		a.invalidate()
 		return
 	}
-	go func() {
+	a.mu.Lock()
+	if a.webShareBusy {
+		a.mu.Unlock()
+		return
+	}
+	a.webShareBusy = true
+	a.mu.Unlock()
+	a.invalidate()
+
+	a.safeGo("revoke-web-share", func() {
+		defer a.finishWebShareAction()
 		ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 		defer cancel()
 		if err := c.RevokeWebShare(ctx, share.ID, share.Token); err != nil {
@@ -1809,7 +2090,7 @@ func (a *nativeApp) revokeSelectedWebShare() {
 		a.applyState(c.State())
 		a.refreshWebSharesFromState(c.State())
 		a.invalidate()
-	}()
+	})
 }
 
 func (a *nativeApp) copySelectedWebShare() {
@@ -1854,7 +2135,7 @@ func (a *nativeApp) draftLanguage() string {
 	if a.settingsUI.language.Value != "" {
 		return a.settingsUI.language.Value
 	}
-	return a.settings.Language
+	return a.settingsSnapshot().Language
 }
 
 type optionItem struct {
@@ -1947,7 +2228,11 @@ const (
 )
 
 func (a *nativeApp) button(gtx layout.Context, b *widget.Clickable, txt string, kind buttonKind, enabled bool) layout.Dimensions {
-	style := material.Button(a.theme, b, txt)
+	return buttonWithTheme(gtx, a.theme, b, txt, kind, enabled)
+}
+
+func buttonWithTheme(gtx layout.Context, th *material.Theme, b *widget.Clickable, txt string, kind buttonKind, enabled bool) layout.Dimensions {
+	style := material.Button(th, b, txt)
 	style.CornerRadius = 8
 	style.Inset = layout.Inset{Top: 9, Bottom: 9, Left: 14, Right: 14}
 	style.TextSize = 13
@@ -1991,7 +2276,11 @@ func (a *nativeApp) inputField(gtx layout.Context, ed *widget.Editor, hint strin
 }
 
 func (a *nativeApp) label(gtx layout.Context, txt string, size unit.Sp, col color.NRGBA, weight font.Weight) layout.Dimensions {
-	l := material.Label(a.theme, size, txt)
+	return labelWithTheme(gtx, a.theme, txt, size, col, weight)
+}
+
+func labelWithTheme(gtx layout.Context, th *material.Theme, txt string, size unit.Sp, col color.NRGBA, weight font.Weight) layout.Dimensions {
+	l := material.Label(th, size, txt)
 	l.Color = col
 	l.Font.Weight = weight
 	l.WrapPolicy = text.WrapWords
@@ -1999,10 +2288,7 @@ func (a *nativeApp) label(gtx layout.Context, txt string, size unit.Sp, col colo
 }
 
 func (a *nativeApp) tr(zh, en string) string {
-	a.mu.Lock()
-	lang := a.settings.Language
-	a.mu.Unlock()
-	if lang == "en" {
+	if a.english.Load() {
 		return en
 	}
 	return zh
@@ -2246,8 +2532,32 @@ func decodeFrameImage(dataURL string) (image.Image, error) {
 	return img, err
 }
 
+func newClientLogger() (*slog.Logger, *os.File) {
+	path := appLogPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})), nil
+	}
+	return slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo})), f
+}
+
+func executableDir() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
 func appConfigPath() string {
-	return filepath.Join(".", "beacondesk-client.json")
+	return filepath.Join(executableDir(), "beacondesk-client.json")
+}
+
+func appLogPath() string {
+	return filepath.Join(executableDir(), "beacondesk-client.log")
 }
 
 func loadUISettings() uiSettings {
@@ -2502,9 +2812,74 @@ func formatMaybe(v int64, format string) string {
 
 func formatQuality(state coreclient.State) string {
 	if state.CaptureQuality == 0 {
+		if state.LastFrameKind == protocol.StreamKindStatus || state.LastFrameKind == protocol.StreamKindError {
+			return "等待画面"
+		}
 		return "-"
 	}
 	return fmt.Sprintf("%d / %d FPS", state.CaptureQuality, state.CurrentFPS)
+}
+
+func humanRelayError(message string, english bool) string {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "invalid token"):
+		if english {
+			return "Invalid access token. Make sure Settings -> Connection -> Access token matches the server shared_token, then save and reconnect."
+		}
+		return "访问令牌无效：请确认本机“设置 -> 连接服务器 -> 访问令牌”和服务器 shared_token 一致，然后保存并重新连接。"
+	case strings.Contains(lower, "target device") && strings.Contains(lower, "offline"):
+		if english {
+			return "The target device is offline or the device ID is wrong. Make sure the peer also shows Registered and copy the full device ID."
+		}
+		return "目标设备不在线或设备 ID 填错：请确认对方也显示“已注册”，并复制完整设备 ID。"
+	case strings.Contains(lower, "device is not registered") || strings.Contains(lower, "requesting device is not registered"):
+		if english {
+			return "This device is not registered yet. Check the access token and wait until the header shows Registered."
+		}
+		return "本机尚未注册成功：请检查访问令牌并等待顶部显示“已注册”。"
+	case strings.Contains(lower, "invalid target temporary code"):
+		if english {
+			return "The temporary code is wrong or expired."
+		}
+		return "临时验证码错误或已失效。"
+	case strings.Contains(lower, "target temporary code expired"):
+		if english {
+			return "The target temporary code has expired. Ask the peer to generate a new code."
+		}
+		return "目标临时验证码已过期，请让对方重新生成验证码。"
+	case strings.Contains(lower, "session") && strings.Contains(lower, "not found"):
+		if english {
+			return "The remote session no longer exists. Please request assistance again."
+		}
+		return "远程会话已不存在，请重新发起协助请求。"
+	default:
+		if english {
+			return "Relay error: " + message
+		}
+		return "中转错误：" + message
+	}
+}
+
+func humanScreenError(message string, english bool) string {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "getdc") || strings.Contains(lower, "bitblt") || strings.Contains(lower, "getdibits") || strings.Contains(lower, "screen dimensions"):
+		if english {
+			return "Screen capture failed. Make sure the controlled device is unlocked, a user desktop is visible, and the app is running in that desktop session."
+		}
+		return "屏幕采集失败：请确认被控端未锁屏、当前用户桌面可见，并且客户端运行在该桌面会话内。"
+	case strings.Contains(lower, "not implemented"):
+		if english {
+			return "Screen capture is not implemented on this platform yet."
+		}
+		return "当前平台暂未实现屏幕采集。"
+	default:
+		if english {
+			return "Screen error: " + message
+		}
+		return "画面错误：" + message
+	}
 }
 
 func mediaSummary(s uiSettings) string {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,9 +95,9 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 
-	go c.readLoop(ctx)
-	go c.heartbeatLoop(ctx)
-	go c.telemetryLoop(ctx)
+	c.safeGo("read-loop", func() { c.readLoop(ctx) })
+	c.safeGo("heartbeat-loop", func() { c.heartbeatLoop(ctx) })
+	c.safeGo("telemetry-loop", func() { c.telemetryLoop(ctx) })
 	return nil
 }
 
@@ -315,6 +316,7 @@ func (c *Client) connect(ctx context.Context) error {
 		WebSocketPath:         c.opts.WebSocketPath,
 		TLSServerName:         c.opts.TLSServerName,
 		TLSInsecureSkipVerify: c.opts.TLSSkipVerify,
+		TLSCertSHA256:         c.opts.TLSCertSHA256,
 	})
 	if err != nil {
 		return err
@@ -515,6 +517,9 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 		c.setState(func(s *State) {
 			s.Registered = true
 			s.DeviceID = payload.DeviceID
+			if payload.DeviceName != "" {
+				s.DeviceName = payload.DeviceName
+			}
 		})
 		c.emit("device.registered", "registered as "+payload.DeviceID)
 		if c.opts.TargetDeviceID != "" {
@@ -592,20 +597,47 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 		if err != nil {
 			return err
 		}
+		shouldSendView := payload.ShouldSendView
+		if payload.LocalRole == "" && (c.opts.SendScreenFrames || c.opts.SendMockFrames) {
+			shouldSendView = true
+		}
 		c.setState(func(s *State) {
 			s.SessionID = payload.SessionID
 			s.PeerID = payload.PeerID
 			s.PeerName = payload.PeerName
 			s.SessionMode = payload.Mode
+			s.SessionLocalRole = payload.LocalRole
+			s.ShouldSendView = shouldSendView
 			s.InputAllowed = payload.InputAllowed
+			s.LastFrameData = ""
+			s.LastFrameKind = ""
+			s.LastFrameStatus = ""
+			s.LastFrameError = ""
+			s.LastFrameWidth = 0
+			s.LastFrameHeight = 0
 		})
 		c.recordAudit("session.ready", payload.PeerID, payload.SessionID, payload.Mode, fmt.Sprintf("input_allowed=%t", payload.InputAllowed))
-		c.emit("session.ready", fmt.Sprintf("session ready with %s mode=%s input=%t", payload.PeerID, payload.Mode, payload.InputAllowed))
-		if c.opts.SendMockFrames {
-			go c.mockFrameLoop(ctx, payload.SessionID)
-		}
-		if c.opts.SendScreenFrames {
-			go c.screenFrameLoop(ctx, payload.SessionID)
+		c.emit("session.ready", fmt.Sprintf("session ready with %s mode=%s input=%t role=%s", payload.PeerID, payload.Mode, payload.InputAllowed, payload.LocalRole))
+		if shouldSendView {
+			switch {
+			case c.opts.SendScreenFrames:
+				c.safeGo("screen-frame-loop", func() { c.screenFrameLoop(ctx, payload.SessionID) })
+			case c.opts.SendMockFrames:
+				c.safeGo("mock-frame-loop", func() { c.mockFrameLoop(ctx, payload.SessionID) })
+			default:
+				c.setState(func(s *State) {
+					s.LastFrameKind = protocol.StreamKindStatus
+					s.LastFrameStatus = "被控端尚未开启屏幕画面发送，请在被控端设置 -> 授权中开启“发送屏幕画面”。"
+					s.LastFrameError = ""
+					s.LastFrameData = ""
+					s.LastFrameWidth = 0
+					s.LastFrameHeight = 0
+				})
+				c.safeGo("stream-status", func() {
+					_ = c.streamStatus(ctx, payload.SessionID, "被控端尚未开启屏幕画面发送，请在被控端设置 -> 授权中开启“发送屏幕画面”。")
+				})
+				c.emit("screen.disabled", "screen frame sending is disabled")
+			}
 		}
 	case protocol.TypeStreamFrame:
 		payload, err := protocol.DecodePayload[protocol.StreamFramePayload](msg)
@@ -617,12 +649,26 @@ func (c *Client) handleMessage(ctx context.Context, msg protocol.Envelope) error
 			s.LastFrameKind = payload.Kind
 			s.LastFrameWidth = payload.Width
 			s.LastFrameHeight = payload.Height
-			if payload.Kind == "jpeg" {
+			switch payload.Kind {
+			case protocol.StreamKindJPEG:
 				s.LastFrameData = "data:image/jpeg;base64," + payload.Data
+				s.LastFrameStatus = ""
+				s.LastFrameError = ""
+			case protocol.StreamKindStatus:
+				s.LastFrameStatus = payload.Data
+				s.LastFrameError = ""
+			case protocol.StreamKindError:
+				s.LastFrameError = payload.Data
+				s.LastFrameStatus = ""
+				s.LastFrameData = ""
 			}
 		})
-		if payload.Kind == "jpeg" {
+		if payload.Kind == protocol.StreamKindJPEG {
 			c.emit("stream.frame", fmt.Sprintf("received jpeg frame %d (%dx%d)", payload.FrameID, payload.Width, payload.Height))
+		} else if payload.Kind == protocol.StreamKindError {
+			c.emit("stream.error", payload.Data)
+		} else if payload.Kind == protocol.StreamKindStatus {
+			c.emit("stream.status", payload.Data)
 		} else {
 			c.emit("stream.frame", fmt.Sprintf("received frame %d: %s", payload.FrameID, payload.Data))
 		}
@@ -744,6 +790,15 @@ func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
 	})
 	if err != nil {
 		c.emit("screen.error", err.Error())
+		c.setState(func(s *State) {
+			s.LastFrameKind = protocol.StreamKindError
+			s.LastFrameError = "无法初始化屏幕采集：" + err.Error()
+			s.LastFrameStatus = ""
+			s.LastFrameData = ""
+			s.LastFrameWidth = 0
+			s.LastFrameHeight = 0
+		})
+		_ = c.streamError(ctx, sessionID, "无法初始化屏幕采集："+err.Error())
 		return
 	}
 	defer capturer.Close()
@@ -758,6 +813,7 @@ func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
 
 	ticker := time.NewTicker(frameInterval(currentFPS))
 	defer ticker.Stop()
+	var lastErrorSent time.Time
 
 	for {
 		select {
@@ -767,6 +823,18 @@ func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
 			frame, err := capturer.Capture(ctx)
 			if err != nil {
 				c.emit("screen.error", err.Error())
+				c.setState(func(s *State) {
+					s.LastFrameKind = protocol.StreamKindError
+					s.LastFrameError = "无法采集屏幕：" + err.Error()
+					s.LastFrameStatus = ""
+					s.LastFrameData = ""
+					s.LastFrameWidth = 0
+					s.LastFrameHeight = 0
+				})
+				if time.Since(lastErrorSent) >= 5*time.Second {
+					lastErrorSent = time.Now()
+					_ = c.streamError(ctx, sessionID, "无法采集屏幕："+err.Error())
+				}
 				continue
 			}
 			decision := detector.Observe(frame)
@@ -775,7 +843,7 @@ func (c *Client) screenFrameLoop(ctx context.Context, sessionID string) {
 			}
 			payload := protocol.StreamFramePayload{
 				FrameID:   frame.ID,
-				Kind:      frame.Codec,
+				Kind:      protocol.StreamKindJPEG,
 				Data:      base64.StdEncoding.EncodeToString(frame.Data),
 				MimeType:  "image/jpeg",
 				Width:     frame.Width,
@@ -817,7 +885,7 @@ func (c *Client) mockFrameLoop(ctx context.Context, sessionID string) {
 			frameID++
 			payload := protocol.StreamFramePayload{
 				FrameID:   frameID,
-				Kind:      "mock-text",
+				Kind:      protocol.StreamKindStatus,
 				Data:      fmt.Sprintf("mock desktop frame %d from %s", frameID, c.identity.DeviceID),
 				Width:     1280,
 				Height:    720,
@@ -834,6 +902,31 @@ func (c *Client) mockFrameLoop(ctx context.Context, sessionID string) {
 			c.emit("stream.sent", fmt.Sprintf("sent mock frame %d", frameID))
 		}
 	}
+}
+
+func (c *Client) streamStatus(ctx context.Context, sessionID string, message string) error {
+	return c.streamTextFrame(ctx, sessionID, protocol.StreamKindStatus, message)
+}
+
+func (c *Client) streamError(ctx context.Context, sessionID string, message string) error {
+	return c.streamTextFrame(ctx, sessionID, protocol.StreamKindError, message)
+}
+
+func (c *Client) streamTextFrame(ctx context.Context, sessionID string, kind string, message string) error {
+	if message == "" {
+		message = kind
+	}
+	payload := protocol.StreamFramePayload{
+		FrameID:   time.Now().UnixMilli(),
+		Kind:      kind,
+		Data:      message,
+		Width:     1280,
+		Height:    720,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	msg := protocol.MustEnvelope(protocol.TypeStreamFrame, c.identity.DeviceID, "", payload)
+	msg.SessionID = sessionID
+	return c.write(ctx, msg)
 }
 
 func (c *Client) estimatedBitrateKbpsSince(connectedAt time.Time) int64 {
@@ -949,6 +1042,17 @@ func (c *Client) setState(update func(*State)) {
 	update(&c.state)
 }
 
+func (c *Client) safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("client goroutine panic", "name", name, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		fn()
+	}()
+}
+
 func (c *Client) pendingPeerID() string {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
@@ -992,7 +1096,15 @@ func clearSession(s *State) {
 	s.PeerID = ""
 	s.PeerName = ""
 	s.SessionMode = ""
+	s.SessionLocalRole = ""
+	s.ShouldSendView = false
 	s.InputAllowed = false
+	s.LastFrameData = ""
+	s.LastFrameKind = ""
+	s.LastFrameStatus = ""
+	s.LastFrameError = ""
+	s.LastFrameWidth = 0
+	s.LastFrameHeight = 0
 }
 
 func upsertWebShare(s *State, share protocol.WebSharePayload) {

@@ -246,17 +246,37 @@ do_uninstall() {
   echo "Configuration remains in ${CONFIG_DIR}; remove it manually if no longer needed."
 }
 
+print_fingerprint() {
+  cert="$CONFIG_DIR/tls/selfsigned.crt"
+  if [ ! -f "$cert" ] && [ -f "$CONFIG_DIR/relay.conf" ]; then
+    configured="$(awk -F= '$1 ~ /^[[:space:]]*tls_cert_file[[:space:]]*$/ { gsub(/[[:space:]\042\047]/, "", $2); print $2 }' "$CONFIG_DIR/relay.conf" | tail -n 1)"
+    if [ -n "$configured" ]; then
+      cert="$configured"
+    fi
+  fi
+  if [ ! -f "$cert" ]; then
+    echo "TLS certificate not found: $cert" >&2
+    exit 1
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "openssl is required to print certificate fingerprint." >&2
+    exit 1
+  fi
+  openssl x509 -in "$cert" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g'
+}
+
 case "$ACTION" in
   install) do_install ;;
   upgrade) do_upgrade ;;
   uninstall) do_uninstall ;;
+  fingerprint) print_fingerprint ;;
   start|stop|restart|status)
     need_root
     need_systemd
     systemctl "$ACTION" beacondesk-relay
     ;;
   *)
-    echo "Usage: $0 [install|upgrade|uninstall|start|stop|restart|status]" >&2
+    echo "Usage: $0 [install|upgrade|uninstall|fingerprint|start|stop|restart|status]" >&2
     exit 1
     ;;
 esac

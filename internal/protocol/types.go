@@ -28,6 +28,12 @@ const (
 )
 
 const (
+	StreamKindJPEG   = "jpeg"
+	StreamKindStatus = "status"
+	StreamKindError  = "error"
+)
+
+const (
 	RoleController = "controller"
 	RoleControlled = "controlled"
 	RolePeer       = "peer"

@@ -61,6 +61,7 @@ type RegisterPayload struct {
 
 type RegisteredPayload struct {
 	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name,omitempty"`
 	ServerTime int64  `json:"server_time"`
 	Message    string `json:"message"`
 }
@@ -145,12 +146,14 @@ type SessionConfirmPayload struct {
 }
 
 type SessionReadyPayload struct {
-	SessionID    string `json:"session_id"`
-	PeerID       string `json:"peer_id"`
-	PeerName     string `json:"peer_name,omitempty"`
-	Mode         string `json:"mode"`
-	RelayRoute   bool   `json:"relay_route"`
-	InputAllowed bool   `json:"input_allowed"`
+	SessionID      string `json:"session_id"`
+	PeerID         string `json:"peer_id"`
+	PeerName       string `json:"peer_name,omitempty"`
+	Mode           string `json:"mode"`
+	RelayRoute     bool   `json:"relay_route"`
+	InputAllowed   bool   `json:"input_allowed"`
+	LocalRole      string `json:"local_role,omitempty"`
+	ShouldSendView bool   `json:"should_send_view,omitempty"`
 }
 
 type StreamFramePayload struct {
